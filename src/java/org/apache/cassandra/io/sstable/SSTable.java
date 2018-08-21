@@ -23,7 +23,6 @@ import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArraySet;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Sets;
@@ -37,6 +36,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.DiskOptimizationStrategy;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -60,6 +60,8 @@ public abstract class SSTable
     static final Logger logger = LoggerFactory.getLogger(SSTable.class);
 
     public static final int TOMBSTONE_HISTOGRAM_BIN_SIZE = 100;
+    public static final int TOMBSTONE_HISTOGRAM_SPOOL_SIZE = 100000;
+    public static final int TOMBSTONE_HISTOGRAM_TTL_ROUND_SECONDS = Integer.valueOf(System.getProperty("cassandra.streaminghistogram.roundseconds", "60"));
 
     public final Descriptor descriptor;
     protected final Set<Component> components;
@@ -69,12 +71,9 @@ public abstract class SSTable
     public DecoratedKey first;
     public DecoratedKey last;
 
-    protected SSTable(Descriptor descriptor, CFMetaData metadata)
-    {
-        this(descriptor, new HashSet<>(), metadata);
-    }
+    protected final DiskOptimizationStrategy optimizationStrategy;
 
-    protected SSTable(Descriptor descriptor, Set<Component> components, CFMetaData metadata)
+    protected SSTable(Descriptor descriptor, Set<Component> components, CFMetaData metadata, DiskOptimizationStrategy optimizationStrategy)
     {
         // In almost all cases, metadata shouldn't be null, but allowing null allows to create a mostly functional SSTable without
         // full schema definition. SSTableLoader use that ability
@@ -87,6 +86,7 @@ public abstract class SSTable
         this.compression = dataComponents.contains(Component.COMPRESSION_INFO);
         this.components = new CopyOnWriteArraySet<>(dataComponents);
         this.metadata = metadata;
+        this.optimizationStrategy = Objects.requireNonNull(optimizationStrategy);
     }
 
     /**
@@ -102,6 +102,7 @@ public abstract class SSTable
      */
     public static boolean delete(Descriptor desc, Set<Component> components)
     {
+        logger.debug("Deleting sstable: {}", desc);
         // remove the DATA component first if it exists
         if (components.contains(Component.DATA))
             FileUtils.deleteWithConfirm(desc.filenameFor(Component.DATA));
@@ -116,7 +117,6 @@ public abstract class SSTable
         if (components.contains(Component.SUMMARY))
             FileUtils.delete(desc.filenameFor(Component.SUMMARY));
 
-        logger.debug("Deleted {}", desc);
         return true;
     }
 
@@ -161,7 +161,6 @@ public abstract class SSTable
         return descriptor.ksname;
     }
 
-    @VisibleForTesting
     public List<String> getAllFilePaths()
     {
         List<String> ret = new ArrayList<>();
@@ -221,9 +220,17 @@ public abstract class SSTable
         Set<Component> components = Sets.newHashSetWithExpectedSize(knownTypes.size());
         for (Component.Type componentType : knownTypes)
         {
-            Component component = new Component(componentType);
-            if (new File(desc.filenameFor(component)).exists())
-                components.add(component);
+            if (componentType == Component.Type.DIGEST)
+            {
+                if (desc.digestComponent != null && new File(desc.filenameFor(desc.digestComponent)).exists())
+                    components.add(desc.digestComponent);
+            }
+            else
+            {
+                Component component = new Component(componentType);
+                if (new File(desc.filenameFor(component)).exists())
+                    components.add(component);
+            }
         }
         return components;
     }
@@ -237,7 +244,7 @@ public abstract class SSTable
         while (ifile.getFilePointer() < BYTES_CAP && keys < SAMPLES_CAP)
         {
             ByteBufferUtil.skipShortLength(ifile);
-            RowIndexEntry.Serializer.skip(ifile);
+            RowIndexEntry.Serializer.skip(ifile, descriptor.version);
             keys++;
         }
         assert keys > 0 && ifile.getFilePointer() > 0 && ifile.length() > 0 : "Unexpected empty index file: " + ifile;

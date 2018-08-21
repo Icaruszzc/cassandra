@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.List;
 
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public abstract class CollectionSerializer<T> implements TypeSerializer<T>
@@ -30,14 +30,14 @@ public abstract class CollectionSerializer<T> implements TypeSerializer<T>
     protected abstract List<ByteBuffer> serializeValues(T value);
     protected abstract int getElementCount(T value);
 
-    public abstract T deserializeForNativeProtocol(ByteBuffer buffer, int version);
-    public abstract void validateForNativeProtocol(ByteBuffer buffer, int version);
+    public abstract T deserializeForNativeProtocol(ByteBuffer buffer, ProtocolVersion version);
+    public abstract void validateForNativeProtocol(ByteBuffer buffer, ProtocolVersion version);
 
     public ByteBuffer serialize(T value)
     {
         List<ByteBuffer> values = serializeValues(value);
         // See deserialize() for why using the protocol v3 variant is the right thing to do.
-        return pack(values, getElementCount(value), Server.VERSION_3);
+        return pack(values, getElementCount(value), ProtocolVersion.V3);
     }
 
     public T deserialize(ByteBuffer bytes)
@@ -47,21 +47,16 @@ public abstract class CollectionSerializer<T> implements TypeSerializer<T>
         //  1) when collections are frozen
         //  2) for internal calls.
         // In both case, using the protocol 3 version variant is the right thing to do.
-        return deserializeForNativeProtocol(bytes, Server.VERSION_3);
-    }
-
-    public ByteBuffer reserializeToV3(ByteBuffer bytes)
-    {
-        return serialize(deserializeForNativeProtocol(bytes, 2));
+        return deserializeForNativeProtocol(bytes, ProtocolVersion.V3);
     }
 
     public void validate(ByteBuffer bytes) throws MarshalException
     {
         // Same thing as above
-        validateForNativeProtocol(bytes, Server.VERSION_3);
+        validateForNativeProtocol(bytes, ProtocolVersion.V3);
     }
 
-    public static ByteBuffer pack(Collection<ByteBuffer> buffers, int elements, int version)
+    public static ByteBuffer pack(Collection<ByteBuffer> buffers, int elements, ProtocolVersion version)
     {
         int size = 0;
         for (ByteBuffer bb : buffers)
@@ -74,71 +69,44 @@ public abstract class CollectionSerializer<T> implements TypeSerializer<T>
         return (ByteBuffer)result.flip();
     }
 
-    protected static void writeCollectionSize(ByteBuffer output, int elements, int version)
+    protected static void writeCollectionSize(ByteBuffer output, int elements, ProtocolVersion version)
     {
-        if (version >= Server.VERSION_3)
             output.putInt(elements);
-        else
-            output.putShort((short)elements);
     }
 
-    public static int readCollectionSize(ByteBuffer input, int version)
+    public static int readCollectionSize(ByteBuffer input, ProtocolVersion version)
     {
-        return version >= Server.VERSION_3 ? input.getInt() : ByteBufferUtil.readShortLength(input);
+        return input.getInt();
     }
 
-    protected static int sizeOfCollectionSize(int elements, int version)
+    protected static int sizeOfCollectionSize(int elements, ProtocolVersion version)
     {
-        return version >= Server.VERSION_3 ? 4 : 2;
+        return 4;
     }
 
-    public static void writeValue(ByteBuffer output, ByteBuffer value, int version)
+    public static void writeValue(ByteBuffer output, ByteBuffer value, ProtocolVersion version)
     {
-        if (version >= Server.VERSION_3)
+        if (value == null)
         {
-            if (value == null)
-            {
-                output.putInt(-1);
-                return;
-            }
+            output.putInt(-1);
+            return;
+        }
 
-            output.putInt(value.remaining());
-            output.put(value.duplicate());
-        }
-        else
-        {
-            assert value != null;
-            output.putShort((short)value.remaining());
-            output.put(value.duplicate());
-        }
+        output.putInt(value.remaining());
+        output.put(value.duplicate());
     }
 
-    public static ByteBuffer readValue(ByteBuffer input, int version)
+    public static ByteBuffer readValue(ByteBuffer input, ProtocolVersion version)
     {
-        if (version >= Server.VERSION_3)
-        {
-            int size = input.getInt();
-            if (size < 0)
-                return null;
+        int size = input.getInt();
+        if (size < 0)
+            return null;
 
-            return ByteBufferUtil.readBytes(input, size);
-        }
-        else
-        {
-            return ByteBufferUtil.readBytesWithShortLength(input);
-        }
+        return ByteBufferUtil.readBytes(input, size);
     }
 
-    public static int sizeOfValue(ByteBuffer value, int version)
+    public static int sizeOfValue(ByteBuffer value, ProtocolVersion version)
     {
-        if (version >= Server.VERSION_3)
-        {
-            return value == null ? 4 : 4 + value.remaining();
-        }
-        else
-        {
-            assert value != null;
-            return 2 + value.remaining();
-        }
+        return value == null ? 4 : 4 + value.remaining();
     }
 }

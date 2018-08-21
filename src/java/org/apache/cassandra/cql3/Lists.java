@@ -23,19 +23,22 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
 
 /**
@@ -55,7 +58,7 @@ public abstract class Lists
         return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((ListType)column.type).getElementsType());
     }
 
-    public static class Literal implements Term.Raw
+    public static class Literal extends Term.Raw
     {
         private final List<Term.Raw> elements;
 
@@ -114,9 +117,20 @@ public abstract class Lists
         }
 
         @Override
-        public String toString()
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            return elements.toString();
+            for (Term.Raw term : elements)
+            {
+                AbstractType<?> type = term.getExactTypeIfKnown(keyspace);
+                if (type != null)
+                    return ListType.getInstance(type, false);
+            }
+            return null;
+        }
+
+        public String getText()
+        {
+            return elements.stream().map(Term.Raw::getText).collect(Collectors.joining(", ", "[", "]"));
         }
     }
 
@@ -129,7 +143,7 @@ public abstract class Lists
             this.elements = elements;
         }
 
-        public static Value fromSerialized(ByteBuffer value, ListType type, int version) throws InvalidRequestException
+        public static Value fromSerialized(ByteBuffer value, ListType type, ProtocolVersion version) throws InvalidRequestException
         {
             try
             {
@@ -148,7 +162,7 @@ public abstract class Lists
             }
         }
 
-        public ByteBuffer get(int protocolVersion)
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             return CollectionSerializer.pack(elements, elements.size(), protocolVersion);
         }
@@ -211,20 +225,14 @@ public abstract class Lists
                 if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                     return UNSET_VALUE;
 
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (bytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("List value is too long. List values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    bytes.remaining()));
-
                 buffers.add(bytes);
             }
             return new Value(buffers);
         }
 
-        public Iterable<Function> getFunctions()
+        public void addFunctionsTo(List<Function> functions)
         {
-            return Terms.getFunctions(elements);
+            Terms.addFunctions(elements, functions);
         }
     }
 
@@ -250,18 +258,17 @@ public abstract class Lists
         }
     }
 
-    /*
+    /**
      * For prepend, we need to be able to generate unique but decreasing time
-     * UUID, which is a bit challenging. To do that, given a time in milliseconds,
-     * we adds a number representing the 100-nanoseconds precision and make sure
-     * that within the same millisecond, that number is always decreasing. We
-     * do rely on the fact that the user will only provide decreasing
-     * milliseconds timestamp for that purpose.
+     * UUIDs, which is a bit challenging. To do that, given a time in milliseconds,
+     * we add a number representing the 100-nanoseconds precision and make sure
+     * that within the same millisecond, that number is always decreasing.
      */
-    private static class PrecisionTime
+    static class PrecisionTime
     {
         // Our reference time (1 jan 2010, 00:00:00) in milliseconds.
         private static final long REFERENCE_TIME = 1262304000000L;
+        static final int MAX_NANOS = 9999;
         private static final AtomicReference<PrecisionTime> last = new AtomicReference<>(new PrecisionTime(Long.MAX_VALUE, 0));
 
         public final long millis;
@@ -273,20 +280,51 @@ public abstract class Lists
             this.nanos = nanos;
         }
 
-        static PrecisionTime getNext(long millis)
+        static PrecisionTime getNext(long millis, int count)
         {
+            if (count == 0)
+                return last.get();
+
             while (true)
             {
                 PrecisionTime current = last.get();
 
-                assert millis <= current.millis;
-                PrecisionTime next = millis < current.millis
-                    ? new PrecisionTime(millis, 9999)
-                    : new PrecisionTime(millis, Math.max(0, current.nanos - 1));
+                final PrecisionTime next;
+                if (millis < current.millis)
+                {
+                    next = new PrecisionTime(millis, MAX_NANOS - count);
+                }
+                else
+                {
+                    // in addition to being at the same millisecond, we handle the unexpected case of the millis parameter
+                    // being in the past. That could happen if the System.currentTimeMillis() not operating montonically
+                    // or if one thread is just a really big loser in the compareAndSet game of life.
+                    long millisToUse = millis <= current.millis ? millis : current.millis;
+
+                    // if we will go below zero on the nanos, decrement the millis by one
+                    final int nanosToUse;
+                    if (current.nanos - count >= 0)
+                    {
+                        nanosToUse = current.nanos - count;
+                    }
+                    else
+                    {
+                        nanosToUse = MAX_NANOS - count;
+                        millisToUse -= 1;
+                    }
+
+                    next = new PrecisionTime(millisToUse, nanosToUse);
+                }
 
                 if (last.compareAndSet(current, next))
                     return next;
             }
+        }
+
+        @VisibleForTesting
+        static void set(long millis, int nanos)
+        {
+            last.set(new PrecisionTime(millis, nanos));
         }
     }
 
@@ -365,19 +403,9 @@ public abstract class Lists
 
             CellPath elementPath = existingRow.getComplexColumnData(column).getCellByIndex(idx).path();
             if (value == null)
-            {
-                params.addTombstone(column);
-            }
+                params.addTombstone(column, elementPath);
             else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER)
-            {
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("List value is too long. List values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    value.remaining()));
-
                 params.addCell(column, elementPath, value);
-            }
         }
     }
 
@@ -416,7 +444,7 @@ public abstract class Lists
                 if (value == null)
                     params.addTombstone(column);
                 else
-                    params.addCell(column, value.get(Server.CURRENT_VERSION));
+                    params.addCell(column, value.get(ProtocolVersion.CURRENT));
             }
         }
     }
@@ -435,13 +463,23 @@ public abstract class Lists
             if (value == null || value == UNSET_VALUE)
                 return;
 
-            long time = PrecisionTime.REFERENCE_TIME - (System.currentTimeMillis() - PrecisionTime.REFERENCE_TIME);
-
             List<ByteBuffer> toAdd = ((Value) value).elements;
-            for (int i = toAdd.size() - 1; i >= 0; i--)
+            final int totalCount = toAdd.size();
+
+            // we have to obey MAX_NANOS per batch - in the unlikely event a client has decided to prepend a list with
+            // an insane number of entries.
+            PrecisionTime pt = null;
+            int remainingInBatch = 0;
+            for (int i = totalCount - 1; i >= 0; i--)
             {
-                PrecisionTime pt = PrecisionTime.getNext(time);
-                ByteBuffer uuid = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(pt.millis, pt.nanos));
+                if (remainingInBatch == 0)
+                {
+                    long time = PrecisionTime.REFERENCE_TIME - (System.currentTimeMillis() - PrecisionTime.REFERENCE_TIME);
+                    remainingInBatch = Math.min(PrecisionTime.MAX_NANOS, i) + 1;
+                    pt = PrecisionTime.getNext(time, remainingInBatch);
+                }
+
+                ByteBuffer uuid = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(pt.millis, (pt.nanos + remainingInBatch--)));
                 params.addCell(column, CellPath.create(uuid), toAdd.get(i));
             }
         }

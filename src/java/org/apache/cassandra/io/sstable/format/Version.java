@@ -68,6 +68,12 @@ public abstract class Version
 
     public abstract boolean hasCompactionAncestors();
 
+    public abstract boolean hasBoundaries();
+
+    public abstract boolean hasCommitLogLowerBound();
+
+    public abstract boolean hasCommitLogIntervals();
+
     public String getVersion()
     {
         return version;

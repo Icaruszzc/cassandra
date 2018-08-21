@@ -54,8 +54,6 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
 
     private List<AbstractType<?>> argTypes;
     private AbstractType<?> returnType;
-    private UDFunction udFunction;
-    private boolean replaced;
 
     public CreateFunctionStatement(FunctionName functionName,
                                    String language,
@@ -78,7 +76,7 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
         this.ifNotExists = ifNotExists;
     }
 
-    public Prepared prepare() throws InvalidRequestException
+    public Prepared prepare(ClientState clientState) throws InvalidRequestException
     {
         if (new HashSet<>(argNames).size() != argNames.size())
             throw new InvalidRequestException(String.format("duplicate argument names for given function %s with argument names %s",
@@ -89,7 +87,7 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
             argTypes.add(prepareType("arguments", rawType));
 
         returnType = prepareType("return type", rawReturnType);
-        return super.prepare();
+        return super.prepare(clientState);
     }
 
     public void prepareKeyspace(ClientState state) throws InvalidRequestException
@@ -140,20 +138,14 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
             throw new InvalidRequestException(String.format("Cannot add function '%s' to non existing keyspace '%s'.", functionName.name, functionName.keyspace));
     }
 
-    public Event.SchemaChange changeEvent()
-    {
-        return new Event.SchemaChange(replaced ? Event.SchemaChange.Change.UPDATED : Event.SchemaChange.Change.CREATED,
-                                      Event.SchemaChange.Target.FUNCTION,
-                                      udFunction.name().keyspace, udFunction.name().name, AbstractType.asCQLTypeStringList(udFunction.argTypes()));
-    }
-
-    public boolean announceMigration(boolean isLocalOnly) throws RequestValidationException
+    public Event.SchemaChange announceMigration(QueryState queryState, boolean isLocalOnly) throws RequestValidationException
     {
         Function old = Schema.instance.findFunction(functionName, argTypes).orElse(null);
-        if (old != null)
+        boolean replaced = old != null;
+        if (replaced)
         {
             if (ifNotExists)
-                return false;
+                return null;
             if (!orReplace)
                 throw new InvalidRequestException(String.format("Function %s already exists", old));
             if (!(old instanceof ScalarFunction))
@@ -167,12 +159,13 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
                                                                 functionName, returnType.asCQL3Type(), old.returnType().asCQL3Type()));
         }
 
-        this.udFunction = UDFunction.create(functionName, argNames, argTypes, returnType, calledOnNullInput, language, body);
-        this.replaced = old != null;
+        UDFunction udFunction = UDFunction.create(functionName, argNames, argTypes, returnType, calledOnNullInput, language, body);
 
         MigrationManager.announceNewFunction(udFunction, isLocalOnly);
 
-        return true;
+        return new Event.SchemaChange(replaced ? Event.SchemaChange.Change.UPDATED : Event.SchemaChange.Change.CREATED,
+                                      Event.SchemaChange.Target.FUNCTION,
+                                      udFunction.name().keyspace, udFunction.name().name, AbstractType.asCQLTypeStringList(udFunction.argTypes()));
     }
 
     private AbstractType<?> prepareType(String typeName, CQL3Type.Raw rawType)

@@ -19,6 +19,7 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
@@ -38,6 +39,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.BTreeSearchIterator;
+import org.apache.cassandra.utils.btree.BTreeRemoval;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 
 /**
@@ -46,12 +48,26 @@ import org.apache.cassandra.utils.btree.UpdateFunction;
  * Note that in practice, it will either store only static columns, or only regular ones. When
  * we need both type of columns, we use a {@link PartitionColumns} object.
  */
-public class Columns implements Iterable<ColumnDefinition>
+public class Columns extends AbstractCollection<ColumnDefinition> implements Collection<ColumnDefinition>
 {
     public static final Serializer serializer = new Serializer();
     public static final Columns NONE = new Columns(BTree.empty(), 0);
-    public static final ColumnDefinition FIRST_COMPLEX = new ColumnDefinition("", "", ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
-                                                                              SetType.getInstance(UTF8Type.instance, true), null, ColumnDefinition.Kind.REGULAR);
+
+    private static final ColumnDefinition FIRST_COMPLEX_STATIC =
+        new ColumnDefinition("",
+                             "",
+                             ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
+                             SetType.getInstance(UTF8Type.instance, true),
+                             ColumnDefinition.NO_POSITION,
+                             ColumnDefinition.Kind.STATIC);
+
+    private static final ColumnDefinition FIRST_COMPLEX_REGULAR =
+        new ColumnDefinition("",
+                             "",
+                             ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
+                             SetType.getInstance(UTF8Type.instance, true),
+                             ColumnDefinition.NO_POSITION,
+                             ColumnDefinition.Kind.REGULAR);
 
     private final Object[] columns;
     private final int complexIdx; // Index of the first complex column
@@ -86,7 +102,7 @@ public class Columns implements Iterable<ColumnDefinition>
      * @param s the set from which to create the new {@code Columns}.
      * @return the newly created {@code Columns} containing the columns from {@code s}.
      */
-    public static Columns from(Set<ColumnDefinition> s)
+    public static Columns from(Collection<ColumnDefinition> s)
     {
         Object[] tree = BTree.<ColumnDefinition>builder(Comparator.naturalOrder()).addAll(s).build();
         return new Columns(tree, findFirstComplexIdx(tree));
@@ -94,11 +110,14 @@ public class Columns implements Iterable<ColumnDefinition>
 
     private static int findFirstComplexIdx(Object[] tree)
     {
-        // have fast path for common no-complex case
+        if (BTree.isEmpty(tree))
+            return 0;
+
         int size = BTree.size(tree);
-        if (!BTree.isEmpty(tree) && BTree.<ColumnDefinition>findByIndex(tree, size - 1).isSimple())
-            return size;
-        return BTree.ceilIndex(tree, Comparator.naturalOrder(), FIRST_COMPLEX);
+        ColumnDefinition last = BTree.findByIndex(tree, size - 1);
+        return last.isSimple()
+             ? size
+             : BTree.ceilIndex(tree, Comparator.naturalOrder(), last.isStatic() ? FIRST_COMPLEX_STATIC : FIRST_COMPLEX_REGULAR);
     }
 
     /**
@@ -136,7 +155,7 @@ public class Columns implements Iterable<ColumnDefinition>
      *
      * @return the total number of columns in this object.
      */
-    public int columnCount()
+    public int size()
     {
         return BTree.size(columns);
     }
@@ -261,14 +280,16 @@ public class Columns implements Iterable<ColumnDefinition>
      *
      * @return whether all the columns of {@code other} are contained by this object.
      */
-    public boolean contains(Columns other)
+    public boolean containsAll(Collection<?> other)
     {
-        if (other.columns.length > columns.length)
+        if (other == this)
+            return true;
+        if (other.size() > this.size())
             return false;
 
         BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iter = BTree.slice(columns, Comparator.naturalOrder(), BTree.Dir.ASC);
-        for (ColumnDefinition def : BTree.<ColumnDefinition>iterable(other.columns))
-            if (iter.next(def) == null)
+        for (Object def : other)
+            if (iter.next((ColumnDefinition) def) == null)
                 return false;
         return true;
     }
@@ -336,7 +357,7 @@ public class Columns implements Iterable<ColumnDefinition>
         if (!contains(column))
             return this;
 
-        Object[] newColumns = BTree.<ColumnDefinition>transformAndFilter(columns, (c) -> c.equals(column) ? null : c);
+        Object[] newColumns = BTreeRemoval.<ColumnDefinition>remove(columns, Comparator.naturalOrder(), column);
         return new Columns(newColumns);
     }
 
@@ -356,6 +377,23 @@ public class Columns implements Iterable<ColumnDefinition>
     {
         for (ColumnDefinition c : this)
             digest.update(c.name.bytes.duplicate());
+    }
+
+    public void digest(MessageDigest digest, Set<ByteBuffer> columnsToExclude)
+    {
+        for (ColumnDefinition c : this)
+            if (!columnsToExclude.contains(c.name.bytes))
+                digest.update(c.name.bytes.duplicate());
+    }
+
+    /**
+     * Apply a function to each column definition in forwards or reversed order.
+     * @param function
+     * @param reversed
+     */
+    public void apply(Consumer<ColumnDefinition> function, boolean reversed)
+    {
+        BTree.apply(columns, function, reversed);
     }
 
     @Override
@@ -379,28 +417,28 @@ public class Columns implements Iterable<ColumnDefinition>
     @Override
     public String toString()
     {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder("[");
         boolean first = true;
         for (ColumnDefinition def : this)
         {
             if (first) first = false; else sb.append(" ");
             sb.append(def.name);
         }
-        return sb.toString();
+        return sb.append("]").toString();
     }
 
     public static class Serializer
     {
         public void serialize(Columns columns, DataOutputPlus out) throws IOException
         {
-            out.writeVInt(columns.columnCount());
+            out.writeUnsignedVInt(columns.size());
             for (ColumnDefinition column : columns)
                 ByteBufferUtil.writeWithVIntLength(column.name.bytes, out);
         }
 
         public long serializedSize(Columns columns)
         {
-            long size = TypeSizes.sizeofVInt(columns.columnCount());
+            long size = TypeSizes.sizeofUnsignedVInt(columns.size());
             for (ColumnDefinition column : columns)
                 size += ByteBufferUtil.serializedSizeWithVIntLength(column.name.bytes);
             return size;
@@ -408,13 +446,14 @@ public class Columns implements Iterable<ColumnDefinition>
 
         public Columns deserialize(DataInputPlus in, CFMetaData metadata) throws IOException
         {
-            int length = (int)in.readVInt();
+            int length = (int)in.readUnsignedVInt();
             BTree.Builder<ColumnDefinition> builder = BTree.builder(Comparator.naturalOrder());
             builder.auto(false);
             for (int i = 0; i < length; i++)
             {
                 ByteBuffer name = ByteBufferUtil.readWithVIntLength(in);
                 ColumnDefinition column = metadata.getColumnDefinition(name);
+
                 if (column == null)
                 {
                     // If we don't find the definition, it could be we have data for a dropped column, and we shouldn't
@@ -433,7 +472,7 @@ public class Columns implements Iterable<ColumnDefinition>
          * If both ends have a pre-shared superset of the columns we are serializing, we can send them much
          * more efficiently. Both ends must provide the identically same set of columns.
          */
-        public void serializeSubset(Columns columns, Columns superset, DataOutputPlus out) throws IOException
+        public void serializeSubset(Collection<ColumnDefinition> columns, Columns superset, DataOutputPlus out) throws IOException
         {
             /**
              * We weight this towards small sets, and sets where the majority of items are present, since
@@ -447,8 +486,8 @@ public class Columns implements Iterable<ColumnDefinition>
              * to a vint encoded set of deltas, either adding or subtracting (whichever is most efficient).
              * We indicate this switch by sending our bitmap with every bit set, i.e. -1L
              */
-            int columnCount = columns.columnCount();
-            int supersetCount = superset.columnCount();
+            int columnCount = columns.size();
+            int supersetCount = superset.size();
             if (columnCount == supersetCount)
             {
                 out.writeUnsignedVInt(0);
@@ -463,10 +502,10 @@ public class Columns implements Iterable<ColumnDefinition>
             }
         }
 
-        public long serializedSubsetSize(Columns columns, Columns superset)
+        public long serializedSubsetSize(Collection<ColumnDefinition> columns, Columns superset)
         {
-            int columnCount = columns.columnCount();
-            int supersetCount = superset.columnCount();
+            int columnCount = columns.size();
+            int supersetCount = superset.size();
             if (columnCount == supersetCount)
             {
                 return TypeSizes.sizeofUnsignedVInt(0);
@@ -488,7 +527,7 @@ public class Columns implements Iterable<ColumnDefinition>
             {
                 return superset;
             }
-            else if (superset.columnCount() >= 64)
+            else if (superset.size() >= 64)
             {
                 return deserializeLargeSubset(in, superset, (int) encoded);
             }
@@ -512,7 +551,7 @@ public class Columns implements Iterable<ColumnDefinition>
 
         // encodes a 1 bit for every *missing* column, on the assumption presence is more common,
         // and because this is consistent with encoding 0 to represent all present
-        private static long encodeBitmap(Columns columns, Columns superset, int supersetCount)
+        private static long encodeBitmap(Collection<ColumnDefinition> columns, Columns superset, int supersetCount)
         {
             long bitmap = 0L;
             BTreeSearchIterator<ColumnDefinition, ColumnDefinition> iter = superset.iterator();
@@ -521,7 +560,7 @@ public class Columns implements Iterable<ColumnDefinition>
             for (ColumnDefinition column : columns)
             {
                 if (iter.next(column) == null)
-                    throw new IllegalStateException();
+                    throw new IllegalStateException(columns + " is not a subset of " + superset);
 
                 int currentIndex = iter.indexOfCurrent();
                 int count = currentIndex - expectIndex;
@@ -537,7 +576,7 @@ public class Columns implements Iterable<ColumnDefinition>
         }
 
         @DontInline
-        private void serializeLargeSubset(Columns columns, int columnCount, Columns superset, int supersetCount, DataOutputPlus out) throws IOException
+        private void serializeLargeSubset(Collection<ColumnDefinition> columns, int columnCount, Columns superset, int supersetCount, DataOutputPlus out) throws IOException
         {
             // write flag indicating we're in lengthy mode
             out.writeUnsignedVInt(supersetCount - columnCount);
@@ -572,7 +611,7 @@ public class Columns implements Iterable<ColumnDefinition>
         @DontInline
         private Columns deserializeLargeSubset(DataInputPlus in, Columns superset, int delta) throws IOException
         {
-            int supersetCount = superset.columnCount();
+            int supersetCount = superset.size();
             int columnCount = supersetCount - delta;
 
             BTree.Builder<ColumnDefinition> builder = BTree.builder(Comparator.naturalOrder());
@@ -609,7 +648,7 @@ public class Columns implements Iterable<ColumnDefinition>
         }
 
         @DontInline
-        private int serializeLargeSubsetSize(Columns columns, int columnCount, Columns superset, int supersetCount)
+        private int serializeLargeSubsetSize(Collection<ColumnDefinition> columns, int columnCount, Columns superset, int supersetCount)
         {
             // write flag indicating we're in lengthy mode
             int size = TypeSizes.sizeofUnsignedVInt(supersetCount - columnCount);

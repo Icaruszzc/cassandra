@@ -22,6 +22,7 @@ import java.util.*;
 import com.google.common.base.Predicate;
 import com.google.common.collect.*;
 
+import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.Throwables;
 
@@ -106,12 +107,12 @@ class Helpers
             assert !reader.isReplaced();
     }
 
-    static Throwable markObsolete(List<TransactionLog.Obsoletion> obsoletions, Throwable accumulate)
+    static Throwable markObsolete(List<LogTransaction.Obsoletion> obsoletions, Throwable accumulate)
     {
         if (obsoletions == null || obsoletions.isEmpty())
             return accumulate;
 
-        for (TransactionLog.Obsoletion obsoletion : obsoletions)
+        for (LogTransaction.Obsoletion obsoletion : obsoletions)
         {
             try
             {
@@ -125,13 +126,14 @@ class Helpers
         return accumulate;
     }
 
-    static Throwable prepareForObsoletion(Iterable<SSTableReader> readers, TransactionLog txnLogs, List<TransactionLog.Obsoletion> obsoletions, Throwable accumulate)
+    static Throwable prepareForObsoletion(Iterable<SSTableReader> readers, LogTransaction txnLogs, List<LogTransaction.Obsoletion> obsoletions, Throwable accumulate)
     {
+        Map<SSTable, LogRecord> logRecords = txnLogs.makeRemoveRecords(readers);
         for (SSTableReader reader : readers)
         {
             try
             {
-                obsoletions.add(new TransactionLog.Obsoletion(reader, txnLogs.obsoleted(reader)));
+                obsoletions.add(new LogTransaction.Obsoletion(reader, txnLogs.obsoleted(reader, logRecords.get(reader))));
             }
             catch (Throwable t)
             {
@@ -141,12 +143,12 @@ class Helpers
         return accumulate;
     }
 
-    static Throwable abortObsoletion(List<TransactionLog.Obsoletion> obsoletions, Throwable accumulate)
+    static Throwable abortObsoletion(List<LogTransaction.Obsoletion> obsoletions, Throwable accumulate)
     {
         if (obsoletions == null || obsoletions.isEmpty())
             return accumulate;
 
-        for (TransactionLog.Obsoletion obsoletion : obsoletions)
+        for (LogTransaction.Obsoletion obsoletion : obsoletions)
         {
             try
             {

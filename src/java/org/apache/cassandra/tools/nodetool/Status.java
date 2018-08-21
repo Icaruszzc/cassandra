@@ -27,6 +27,7 @@ import java.text.DecimalFormat;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.SortedMap;
 
 import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
 import org.apache.cassandra.tools.NodeProbe;
@@ -64,7 +65,7 @@ public class Status extends NodeToolCmd
         hostIDMap = probe.getHostIdMap();
         epSnitchInfo = probe.getEndpointSnitchInfoProxy();
 
-        StringBuffer errors = new StringBuffer();
+        StringBuilder errors = new StringBuilder();
 
         Map<InetAddress, Float> ownerships = null;
         boolean hasEffectiveOwns = false;
@@ -76,15 +77,15 @@ public class Status extends NodeToolCmd
         catch (IllegalStateException e)
         {
             ownerships = probe.getOwnership();
-            errors.append("Note: " + e.getMessage() + "%n");
+            errors.append("Note: ").append(e.getMessage()).append("%n");
         }
         catch (IllegalArgumentException ex)
         {
-            System.out.printf("%nError: " + ex.getMessage() + "%n");
+            System.out.printf("%nError: %s%n", ex.getMessage());
             System.exit(1);
         }
 
-        Map<String, SetHostStat> dcs = NodeTool.getOwnershipByDc(probe, resolveIp, tokensToEndpoints, ownerships);
+        SortedMap<String, SetHostStat> dcs = NodeTool.getOwnershipByDc(probe, resolveIp, tokensToEndpoints, ownerships);
 
         // More tokens than nodes (aka vnodes)?
         if (dcs.values().size() < tokensToEndpoints.keySet().size())

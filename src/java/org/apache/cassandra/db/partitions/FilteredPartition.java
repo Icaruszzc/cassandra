@@ -29,7 +29,7 @@ public class FilteredPartition extends ImmutableBTreePartition
 {
     public FilteredPartition(RowIterator rows)
     {
-        super(rows.metadata(), rows.partitionKey(), rows.columns(), build(rows, DeletionInfo.LIVE, false, 16));
+        super(rows.metadata(), rows.partitionKey(), build(rows, DeletionInfo.LIVE, false, 16));
     }
 
     /**
@@ -60,12 +60,12 @@ public class FilteredPartition extends ImmutableBTreePartition
 
             public PartitionColumns columns()
             {
-                return columns;
+                return FilteredPartition.this.columns();
             }
 
             public DecoratedKey partitionKey()
             {
-                return partitionKey;
+                return FilteredPartition.this.partitionKey();
             }
 
             public Row staticRow()

@@ -18,31 +18,32 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.lifecycle.SSTableSet;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.junit.BeforeClass;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.Set;
+
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.tools.SSTableExpiredBlockers;
 import org.apache.cassandra.utils.ByteBufferUtil;
-
-import java.io.IOException;
-import java.util.Collections;
-import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -56,7 +57,11 @@ public class TTLExpiryTest
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
+        // Disable tombstone histogram rounding for tests
+        System.setProperty("cassandra.streaminghistogram.roundseconds", "1");
+
         SchemaLoader.prepareServer();
+
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
                                     CFMetaData.Builder.create(KEYSPACE1, CF_STANDARD1)
@@ -67,6 +72,7 @@ public class TTLExpiryTest
                                                       .addRegularColumn("col2", AsciiType.instance)
                                                       .addRegularColumn("col3", AsciiType.instance)
                                                       .addRegularColumn("col7", AsciiType.instance)
+                                                      .addRegularColumn("col8", MapType.getInstance(AsciiType.instance, AsciiType.instance, true))
                                                       .addRegularColumn("shadow", AsciiType.instance)
                                                       .build().gcGraceSeconds(0));
     }
@@ -141,9 +147,23 @@ public class TTLExpiryTest
     @Test
     public void testSimpleExpire() throws InterruptedException
     {
+        testSimpleExpire(false);
+    }
+
+    @Test
+    public void testBug10944() throws InterruptedException
+    {
+        // Reproduction for CASSANDRA-10944 (at the time of the bug)
+        testSimpleExpire(true);
+    }
+
+    public void testSimpleExpire(boolean force10944Bug) throws InterruptedException
+    {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore("Standard1");
+        cfs.truncateBlocking();
         cfs.disableAutoCompaction();
-        cfs.metadata.gcGraceSeconds(0);
+        // To reproduce #10944, we need our gcBefore to be equal to the locaDeletionTime. A gcGrace of 1 will (almost always) give us that.
+        cfs.metadata.gcGraceSeconds(force10944Bug ? 1 : 0);
         long timestamp = System.currentTimeMillis();
         String key = "ttl";
         new RowUpdateBuilder(cfs.metadata, timestamp, 1, key)
@@ -156,12 +176,16 @@ public class TTLExpiryTest
 
         new RowUpdateBuilder(cfs.metadata, timestamp, 1, key)
             .add("col2", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+            .add("col8", Collections.singletonMap("bar", "foo"))
+            .delete("col1")
             .build()
             .applyUnsafe();
 
 
         cfs.forceBlockingFlush();
-        new RowUpdateBuilder(cfs.metadata, timestamp, 1, key)
+        // To reproduce #10944, we need to avoid the optimization that get rid of full sstable because everything
+        // is known to be gcAble, so keep some data non-expiring in that case.
+        new RowUpdateBuilder(cfs.metadata, timestamp, force10944Bug ? 0 : 1, key)
                     .add("col3", ByteBufferUtil.EMPTY_BYTE_BUFFER)
                     .build()
                     .applyUnsafe();
@@ -178,13 +202,14 @@ public class TTLExpiryTest
         Thread.sleep(2000); // wait for ttl to expire
         assertEquals(4, cfs.getLiveSSTables().size());
         cfs.enableAutoCompaction(true);
-        assertEquals(0, cfs.getLiveSSTables().size());
+        assertEquals(force10944Bug ? 1 : 0, cfs.getLiveSSTables().size());
     }
 
     @Test
     public void testNoExpire() throws InterruptedException, IOException
     {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore("Standard1");
+        cfs.truncateBlocking();
         cfs.disableAutoCompaction();
         cfs.metadata.gcGraceSeconds(0);
         long timestamp = System.currentTimeMillis();
@@ -218,7 +243,10 @@ public class TTLExpiryTest
         cfs.enableAutoCompaction(true);
         assertEquals(1, cfs.getLiveSSTables().size());
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
-        ISSTableScanner scanner = sstable.getScanner(ColumnFilter.all(sstable.metadata), DataRange.allData(cfs.getPartitioner()), false);
+        ISSTableScanner scanner = sstable.getScanner(ColumnFilter.all(sstable.metadata),
+                                                     DataRange.allData(cfs.getPartitioner()),
+                                                     false,
+                                                     SSTableReadsListener.NOOP_LISTENER);
         assertTrue(scanner.hasNext());
         while(scanner.hasNext())
         {
@@ -237,6 +265,7 @@ public class TTLExpiryTest
         cfs.metadata.gcGraceSeconds(0);
 
         new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), "test")
+                .noRowMarker()
                 .add("col1", ByteBufferUtil.EMPTY_BYTE_BUFFER)
                 .build()
                 .applyUnsafe();
@@ -246,6 +275,7 @@ public class TTLExpiryTest
         for (int i = 0; i < 10; i++)
         {
             new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), "test")
+                            .noRowMarker()
                             .delete("col1")
                             .build()
                             .applyUnsafe();

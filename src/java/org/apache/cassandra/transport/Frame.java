@@ -27,7 +27,7 @@ import io.netty.channel.*;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.handler.codec.MessageToMessageEncoder;
-
+import io.netty.util.Attribute;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.transport.messages.ErrorMessage;
@@ -50,16 +50,6 @@ public class Frame
      *   +---------+---------+---------+---------+---------+
      *   |                length                 |
      *   +---------+---------+---------+---------+
-     *
-     *
-     * In versions 1 and 2 the header has a smaller (1 byte) stream id, and is thus defined the following way:
-     *
-     *   0         8        16        24        32
-     *   +---------+---------+---------+---------+
-     *   | version |  flags  | stream  | opcode  |
-     *   +---------+---------+---------+---------+
-     *   |                length                 |
-     *   +---------+---------+---------+---------+
      */
     private Frame(Header header, ByteBuf body)
     {
@@ -77,7 +67,7 @@ public class Frame
         return body.release();
     }
 
-    public static Frame create(Message.Type type, int streamId, int version, EnumSet<Header.Flag> flags, ByteBuf body)
+    public static Frame create(Message.Type type, int streamId, ProtocolVersion version, EnumSet<Header.Flag> flags, ByteBuf body)
     {
         Header header = new Header(version, flags, streamId, type);
         return new Frame(header, body);
@@ -85,23 +75,17 @@ public class Frame
 
     public static class Header
     {
-        // 8 bytes in protocol versions 1 and 2, 8 bytes in protocol version 3 and later
-        public static final int MODERN_LENGTH = 9;
-        public static final int LEGACY_LENGTH = 8;
+        // 9 bytes in protocol version 3 and later
+        public static final int LENGTH = 9;
 
         public static final int BODY_LENGTH_SIZE = 4;
 
-        public final int version;
+        public final ProtocolVersion version;
         public final EnumSet<Flag> flags;
         public final int streamId;
         public final Message.Type type;
 
-        private Header(int version, int flags, int streamId, Message.Type type)
-        {
-            this(version, Flag.deserialize(flags), streamId, type);
-        }
-
-        private Header(int version, EnumSet<Flag> flags, int streamId, Message.Type type)
+        private Header(ProtocolVersion version, EnumSet<Flag> flags, int streamId, Message.Type type)
         {
             this.version = version;
             this.flags = flags;
@@ -109,13 +93,14 @@ public class Frame
             this.type = type;
         }
 
-        public static enum Flag
+        public enum Flag
         {
             // The order of that enum matters!!
             COMPRESSED,
             TRACING,
             CUSTOM_PAYLOAD,
-            WARNING;
+            WARNING,
+            USE_BETA;
 
             private static final Flag[] ALL_VALUES = values();
 
@@ -174,39 +159,32 @@ public class Frame
                 return;
             }
 
-            // Wait until we have read at least the short header
-            if (buffer.readableBytes() < Header.LEGACY_LENGTH)
+            int readableBytes = buffer.readableBytes();
+            if (readableBytes == 0)
                 return;
 
             int idx = buffer.readerIndex();
 
+            // Check the first byte for the protocol version before we wait for a complete header.  Protocol versions
+            // 1 and 2 use a shorter header, so we may never have a complete header's worth of bytes.
             int firstByte = buffer.getByte(idx++);
             Message.Direction direction = Message.Direction.extractFromVersion(firstByte);
-            int version = firstByte & PROTOCOL_VERSION_MASK;
+            int versionNum = firstByte & PROTOCOL_VERSION_MASK;
+            ProtocolVersion version = ProtocolVersion.decode(versionNum);
 
-            if (version > Server.CURRENT_VERSION)
-                throw new ProtocolException(String.format("Invalid or unsupported protocol version (%d); highest supported is %d ",
-                                                          version, Server.CURRENT_VERSION));
-
-            // Wait until we have the complete V3+ header
-            if (version >= Server.VERSION_3 && buffer.readableBytes() < Header.MODERN_LENGTH)
+            // Wait until we have the complete header
+            if (readableBytes < Header.LENGTH)
                 return;
 
             int flags = buffer.getByte(idx++);
+            EnumSet<Header.Flag> decodedFlags = Header.Flag.deserialize(flags);
 
-            int streamId, headerLength;
-            if (version >= Server.VERSION_3)
-            {
-                streamId = buffer.getShort(idx);
-                idx += 2;
-                headerLength = Header.MODERN_LENGTH;
-            }
-            else
-            {
-                streamId = buffer.getByte(idx);
-                idx++;
-                headerLength = Header.LEGACY_LENGTH;
-            }
+            if (version.isBeta() && !decodedFlags.contains(Header.Flag.USE_BETA))
+                throw new ProtocolException(String.format("Beta version of the protocol used (%s), but USE_BETA flag is unset", version),
+                                            version);
+
+            int streamId = buffer.getShort(idx);
+            idx += 2;
 
             // This throws a protocol exceptions if the opcode is unknown
             Message.Type type;
@@ -222,13 +200,7 @@ public class Frame
             long bodyLength = buffer.getUnsignedInt(idx);
             idx += Header.BODY_LENGTH_SIZE;
 
-            if (bodyLength < 0)
-            {
-                buffer.skipBytes(headerLength);
-                throw ErrorMessage.wrap(new ProtocolException("Invalid frame body length: " + bodyLength), streamId);
-            }
-
-            long frameLength = bodyLength + headerLength;
+            long frameLength = bodyLength + Header.LENGTH;
             if (frameLength > MAX_FRAME_LENGTH)
             {
                 // Enter the discard mode and discard everything received so far.
@@ -247,27 +219,28 @@ public class Frame
             // extract body
             ByteBuf body = buffer.slice(idx, (int) bodyLength);
             body.retain();
-            
+
             idx += bodyLength;
             buffer.readerIndex(idx);
 
-            Connection connection = ctx.channel().attr(Connection.attributeKey).get();
+            Attribute<Connection> attrConn = ctx.channel().attr(Connection.attributeKey);
+            Connection connection = attrConn.get();
             if (connection == null)
             {
                 // First message seen on this channel, attach the connection object
                 connection = factory.newConnection(ctx.channel(), version);
-                ctx.channel().attr(Connection.attributeKey).set(connection);
+                attrConn.set(connection);
             }
             else if (connection.getVersion() != version)
             {
                 throw ErrorMessage.wrap(
                         new ProtocolException(String.format(
-                                "Invalid message version. Got %d but previous messages on this connection had version %d",
+                                "Invalid message version. Got %s but previous messages on this connection had version %s",
                                 version, connection.getVersion())),
                         streamId);
             }
 
-            results.add(new Frame(new Header(version, flags, streamId, type), body));
+            results.add(new Frame(new Header(version, decodedFlags, streamId, type), body));
         }
 
         private void fail()
@@ -295,16 +268,15 @@ public class Frame
         public void encode(ChannelHandlerContext ctx, Frame frame, List<Object> results)
         throws IOException
         {
-            int headerLength = frame.header.version >= Server.VERSION_3
-                             ? Header.MODERN_LENGTH
-                             : Header.LEGACY_LENGTH;
-            ByteBuf header = CBUtil.allocator.buffer(headerLength);
+            ByteBuf header = CBUtil.allocator.buffer(Header.LENGTH);
 
             Message.Type type = frame.header.type;
-            header.writeByte(type.direction.addToVersion(frame.header.version));
+            header.writeByte(type.direction.addToVersion(frame.header.version.asInt()));
             header.writeByte(Header.Flag.serialize(frame.header.flags));
 
-            if (frame.header.version >= Server.VERSION_3)
+            // Continue to support writing pre-v3 headers so that we can give proper error messages to drivers that
+            // connect with the v1/v2 protocol. See CASSANDRA-11464.
+            if (frame.header.version.isGreaterOrEqualTo(ProtocolVersion.V3))
                 header.writeShort(frame.header.streamId);
             else
                 header.writeByte(frame.header.streamId);

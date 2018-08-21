@@ -25,23 +25,17 @@ import com.google.common.collect.ImmutableSet;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.cql3.Attributes;
-import org.apache.cassandra.cql3.CQLStatement;
-import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.functions.FunctionName;
 import org.apache.cassandra.cql3.statements.BatchStatement;
 import org.apache.cassandra.cql3.statements.ModificationStatement;
-import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -49,8 +43,6 @@ import static org.junit.Assert.fail;
 
 public class UFAuthTest extends CQLTester
 {
-    private static final Logger logger = LoggerFactory.getLogger(UFAuthTest.class);
-
     String roleName = "test_role";
     AuthenticatedUser user;
     RoleResource role;
@@ -319,14 +311,14 @@ public class UFAuthTest extends CQLTester
     public void systemFunctionsRequireNoExplicitPrivileges() throws Throwable
     {
         // with terminal arguments, so evaluated at prepare time
-        String cql = String.format("UPDATE %s SET v2 = 0 WHERE k = blobasint(intasblob(0))",
+        String cql = String.format("UPDATE %s SET v2 = 0 WHERE k = blobasint(intasblob(0)) and v1 = 0",
                                    KEYSPACE + "." + currentTable());
         getStatement(cql).checkAccess(clientState);
 
         // with non-terminal arguments, so evaluated at execution
         String functionName = createSimpleFunction();
         grantExecuteOnFunction(functionName);
-        cql = String.format("UPDATE %s SET v2 = 0 WHERE k = blobasint(intasblob(%s))",
+        cql = String.format("UPDATE %s SET v2 = 0 WHERE k = blobasint(intasblob(%s)) and v1 = 0",
                             KEYSPACE + "." + currentTable(),
                             functionCall(functionName));
         getStatement(cql).checkAccess(clientState);
@@ -451,6 +443,31 @@ public class UFAuthTest extends CQLTester
         grantExecuteOnFunction(innerFunc);
 
         getStatement(cql).checkAccess(clientState);
+    }
+
+    @Test
+    public void grantAndRevokeSyntaxRequiresExplicitKeyspace() throws Throwable
+    {
+        setupTable("CREATE TABLE %s (k int, s int STATIC, v1 int, v2 int, PRIMARY KEY(k, v1))");
+        String functionName = shortFunctionName(createSimpleFunction());
+        assertRequiresKeyspace(String.format("GRANT EXECUTE ON FUNCTION %s() TO %s",
+                                             functionName,
+                                             role.getRoleName()));
+        assertRequiresKeyspace(String.format("REVOKE EXECUTE ON FUNCTION %s() FROM %s",
+                                             functionName,
+                                             role.getRoleName()));
+    }
+
+    private void assertRequiresKeyspace(String cql) throws Throwable
+    {
+        try
+        {
+            getStatement(cql);
+        }
+        catch (InvalidRequestException e)
+        {
+            assertEquals("In this context function name must be explictly qualified by a keyspace", e.getMessage());
+        }
     }
 
     private void assertPermissionsOnNestedFunctions(String innerFunction, String outerFunction) throws Throwable
@@ -629,100 +646,5 @@ public class UFAuthTest extends CQLTester
     private String functionCall(String functionName, String...args)
     {
         return String.format("%s(%s)", functionName, Joiner.on(",").join(args));
-    }
-
-    static class StubAuthorizer implements IAuthorizer
-    {
-        Map<Pair<String, IResource>, Set<Permission>> userPermissions = new HashMap<>();
-
-        private void clear()
-        {
-            userPermissions.clear();
-        }
-
-        public Set<Permission> authorize(AuthenticatedUser user, IResource resource)
-        {
-            Pair<String, IResource> key = Pair.create(user.getName(), resource);
-            Set<Permission> perms = userPermissions.get(key);
-            return perms != null ? perms : Collections.<Permission>emptySet();
-        }
-
-        public void grant(AuthenticatedUser performer,
-                          Set<Permission> permissions,
-                          IResource resource,
-                          RoleResource grantee) throws RequestValidationException, RequestExecutionException
-        {
-            Pair<String, IResource> key = Pair.create(grantee.getRoleName(), resource);
-            Set<Permission> perms = userPermissions.get(key);
-            if (null == perms)
-            {
-                perms = new HashSet<>();
-                userPermissions.put(key, perms);
-            }
-            perms.addAll(permissions);
-        }
-
-        public void revoke(AuthenticatedUser performer,
-                           Set<Permission> permissions,
-                           IResource resource,
-                           RoleResource revokee) throws RequestValidationException, RequestExecutionException
-        {
-            Pair<String, IResource> key = Pair.create(revokee.getRoleName(), resource);
-            Set<Permission> perms = userPermissions.get(key);
-            if (null != perms)
-                perms.removeAll(permissions);
-            if (perms.isEmpty())
-                userPermissions.remove(key);
-        }
-
-        public Set<PermissionDetails> list(AuthenticatedUser performer,
-                                           Set<Permission> permissions,
-                                           IResource resource,
-                                           RoleResource grantee) throws RequestValidationException, RequestExecutionException
-        {
-            Pair<String, IResource> key = Pair.create(grantee.getRoleName(), resource);
-            Set<Permission> perms = userPermissions.get(key);
-            if (perms == null)
-                return Collections.emptySet();
-
-
-            Set<PermissionDetails> details = new HashSet<>();
-            for (Permission permission : perms)
-            {
-                if (permissions.contains(permission))
-                    details.add(new PermissionDetails(grantee.getRoleName(), resource, permission));
-            }
-            return details;
-        }
-
-        public void revokeAllFrom(RoleResource revokee)
-        {
-            for (Pair<String, IResource> key : userPermissions.keySet())
-                if (key.left.equals(revokee.getRoleName()))
-                    userPermissions.remove(key);
-        }
-
-        public void revokeAllOn(IResource droppedResource)
-        {
-            for (Pair<String, IResource> key : userPermissions.keySet())
-                if (key.right.equals(droppedResource))
-                    userPermissions.remove(key);
-
-        }
-
-        public Set<? extends IResource> protectedResources()
-        {
-            return Collections.emptySet();
-        }
-
-        public void validateConfiguration() throws ConfigurationException
-        {
-
-        }
-
-        public void setup()
-        {
-
-        }
     }
 }

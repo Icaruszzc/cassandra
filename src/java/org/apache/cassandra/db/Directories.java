@@ -17,27 +17,19 @@
  */
 package org.apache.cassandra.db;
 
-import static com.google.common.collect.Sets.newHashSet;
-
 import java.io.File;
 import java.io.FileFilter;
 import java.io.IOError;
 import java.io.IOException;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.ImmutableSet.Builder;
 import com.google.common.collect.Iterables;
 
 import org.apache.commons.lang3.StringUtils;
@@ -46,10 +38,12 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.FSDiskFullWriteError;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.utils.DirectorySizeCalculator;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
@@ -93,9 +87,11 @@ public class Directories
 
     public static final String BACKUPS_SUBDIR = "backups";
     public static final String SNAPSHOT_SUBDIR = "snapshots";
+    public static final String TMP_SUBDIR = "tmp";
     public static final String SECONDARY_INDEX_NAME_SEPARATOR = ".";
 
     public static final DataDirectory[] dataDirectories;
+
     static
     {
         String[] locations = DatabaseDescriptor.getAllDataFileLocations();
@@ -150,7 +146,8 @@ public class Directories
         {
             boolean privilege = false;
 
-            switch (action) {
+            switch (action)
+            {
                 case X:
                     privilege = file.canExecute();
                     break;
@@ -185,6 +182,12 @@ public class Directories
     {
         this(metadata, dataDirectories);
     }
+
+    public Directories(final CFMetaData metadata, Collection<DataDirectory> paths)
+    {
+        this(metadata, paths.toArray(new DataDirectory[paths.size()]));
+    }
+
     /**
      * Create Directories of given ColumnFamily.
      * SSTable directories are created under data_directories defined in cassandra.yaml if not exist at this time.
@@ -266,7 +269,7 @@ public class Directories
                 for (File indexFile : indexFiles)
                 {
                     File destFile = new File(dataPath, indexFile.getName());
-                    logger.debug("Moving index file {} to {}", indexFile, destFile);
+                    logger.trace("Moving index file {} to {}", indexFile, destFile);
                     FileUtils.renameWithConfirm(indexFile, destFile);
                 }
             }
@@ -288,6 +291,19 @@ public class Directories
         return null;
     }
 
+    public DataDirectory getDataDirectoryForFile(File directory)
+    {
+        if (directory != null)
+        {
+            for (DataDirectory dataDirectory : paths)
+            {
+                if (directory.getAbsolutePath().startsWith(dataDirectory.location.getAbsolutePath()))
+                    return dataDirectory;
+            }
+        }
+        return null;
+    }
+
     public Descriptor find(String filename)
     {
         for (File dir : dataPaths)
@@ -303,7 +319,7 @@ public class Directories
      * which may return any non-blacklisted directory - even a data directory that has no usable space.
      * Do not use this method in production code.
      *
-     * @throws IOError if all directories are blacklisted.
+     * @throws FSWriteError if all directories are blacklisted.
      */
     public File getDirectoryForNewSSTables()
     {
@@ -313,17 +329,49 @@ public class Directories
     /**
      * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space.
      *
-     * @throws IOError if all directories are blacklisted.
+     * @throws FSWriteError if all directories are blacklisted.
      */
     public File getWriteableLocationAsFile(long writeSize)
     {
-        return getLocationForDisk(getWriteableLocation(writeSize));
+        File location = getLocationForDisk(getWriteableLocation(writeSize));
+        if (location == null)
+            throw new FSWriteError(new IOException("No configured data directory contains enough space to write " + writeSize + " bytes"), "");
+        return location;
     }
 
     /**
-     * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space.
+     * Returns a temporary subdirectory on non-blacklisted data directory
+     * that _currently_ has {@code writeSize} bytes as usable space.
+     * This method does not create the temporary directory.
      *
      * @throws IOError if all directories are blacklisted.
+     */
+    public File getTemporaryWriteableDirectoryAsFile(long writeSize)
+    {
+        File location = getLocationForDisk(getWriteableLocation(writeSize));
+        if (location == null)
+            return null;
+        return new File(location, TMP_SUBDIR);
+    }
+
+    public void removeTemporaryDirectories()
+    {
+        for (File dataDir : dataPaths)
+        {
+            File tmpDir = new File(dataDir, TMP_SUBDIR);
+            if (tmpDir.exists())
+            {
+                logger.debug("Removing temporary directory {}", tmpDir);
+                FileUtils.deleteRecursive(tmpDir);
+            }
+        }
+    }
+
+    /**
+     * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space, null if
+     * there is not enough space left in all directories.
+     *
+     * @throws FSWriteError if all directories are blacklisted.
      */
     public DataDirectory getWriteableLocation(long writeSize)
     {
@@ -337,14 +385,14 @@ public class Directories
         {
             if (BlacklistedDirectories.isUnwritable(getLocationForDisk(dataDir)))
             {
-                logger.debug("removing blacklisted candidate {}", dataDir.location);
+                logger.trace("removing blacklisted candidate {}", dataDir.location);
                 continue;
             }
             DataDirectoryCandidate candidate = new DataDirectoryCandidate(dataDir);
             // exclude directory if its total writeSize does not fit to data directory
             if (candidate.availableSpace < writeSize)
             {
-                logger.debug("removing candidate {}, usable={}, requested={}", candidate.dataDirectory.location, candidate.availableSpace, writeSize);
+                logger.trace("removing candidate {}, usable={}, requested={}", candidate.dataDirectory.location, candidate.availableSpace, writeSize);
                 tooBig = true;
                 continue;
             }
@@ -354,9 +402,9 @@ public class Directories
 
         if (candidates.isEmpty())
             if (tooBig)
-                return null;
+                throw new FSDiskFullWriteError(new IOException("Insufficient disk space to write " + writeSize + " bytes"), "");
             else
-                throw new IOError(new IOException("All configured data directories have been blacklisted as unwritable for erroring out"));
+                throw new FSWriteError(new IOException("All configured data directories have been blacklisted as unwritable for erroring out"), "");
 
         // shortcut for single data directory systems
         if (candidates.size() == 1)
@@ -402,7 +450,7 @@ public class Directories
         for (DataDirectory dataDir : paths)
         {
             if (BlacklistedDirectories.isUnwritable(getLocationForDisk(dataDir)))
-                  continue;
+                continue;
             DataDirectoryCandidate candidate = new DataDirectoryCandidate(dataDir);
             // exclude directory if its total writeSize does not fit to data directory
             if (candidate.availableSpace < writeSize)
@@ -410,6 +458,26 @@ public class Directories
             totalAvailable += candidate.availableSpace;
         }
         return totalAvailable > expectedTotalWriteSize;
+    }
+
+    public DataDirectory[] getWriteableLocations()
+    {
+        List<DataDirectory> nonBlacklistedDirs = new ArrayList<>();
+        for (DataDirectory dir : paths)
+        {
+            if (!BlacklistedDirectories.isUnwritable(dir.location))
+                nonBlacklistedDirs.add(dir);
+        }
+
+        Collections.sort(nonBlacklistedDirs, new Comparator<DataDirectory>()
+        {
+            @Override
+            public int compare(DataDirectory o1, DataDirectory o2)
+            {
+                return o1.location.compareTo(o2.location);
+            }
+        });
+        return nonBlacklistedDirs.toArray(new DataDirectory[nonBlacklistedDirs.size()]);
     }
 
     public static File getSnapshotDirectory(Descriptor desc, String snapshotName)
@@ -444,6 +512,12 @@ public class Directories
     {
         File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);
         return new File(snapshotDir, "manifest.json");
+    }
+
+    public File getSnapshotSchemaFile(String snapshotName)
+    {
+        File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);
+        return new File(snapshotDir, "schema.cql");
     }
 
     public File getNewEphemeralSnapshotMarkerFile(String snapshotName)
@@ -485,7 +559,8 @@ public class Directories
 
         public long getAvailableSpace()
         {
-            return location.getUsableSpace();
+            long availableSpace = FileUtils.getUsableSpace(location) - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
+            return availableSpace > 0 ? availableSpace : 0;
         }
 
         @Override
@@ -497,13 +572,19 @@ public class Directories
             DataDirectory that = (DataDirectory) o;
 
             return location.equals(that.location);
-
         }
 
         @Override
         public int hashCode()
         {
             return location.hashCode();
+        }
+
+        public String toString()
+        {
+            return "DataDirectory{" +
+                   "location=" + location +
+                   '}';
         }
     }
 
@@ -550,7 +631,7 @@ public class Directories
         TEMPORARY,
 
         /** A transaction log file (contains information on final and temporary files). */
-        TXN_LOG
+        TXN_LOG;
     }
 
     /**
@@ -562,7 +643,7 @@ public class Directories
         /** Throw the exception */
         THROW,
 
-        /** Ignore the txn log file */
+        /** Ignore the problematic parts of the txn log file */
         IGNORE
     }
 
@@ -694,6 +775,24 @@ public class Directories
                             previous = new HashSet<>();
                             components.put(pair.left, previous);
                         }
+                        else if (pair.right.type == Component.Type.DIGEST)
+                        {
+                            if (pair.right != pair.left.digestComponent)
+                            {
+                                // Need to update the DIGEST component as it might be set to another
+                                // digest type as a guess. This may happen if the first component is
+                                // not the DIGEST (but the Data component for example), so the digest
+                                // type is _guessed_ from the Version.
+                                // Although the Version explicitly defines the digest type, it doesn't
+                                // seem to be true under all circumstances. Generated sstables from a
+                                // post 2.1.8 snapshot produced Digest.sha1 files although Version
+                                // defines Adler32.
+                                // TL;DR this piece of code updates the digest component to be "correct".
+                                components.remove(pair.left);
+                                Descriptor updated = pair.left.withDigestComponent(pair.right);
+                                components.put(updated, previous);
+                            }
+                        }
                         previous.add(pair.right);
                         nbFiles++;
                         return false;
@@ -726,7 +825,6 @@ public class Directories
         }
         return snapshotSpaceMap;
     }
-
 
     public List<String> listEphemeralSnapshots()
     {
@@ -792,22 +890,17 @@ public class Directories
             File snapshotDir = new File(dir, join(SNAPSHOT_SUBDIR, tag));
             if (snapshotDir.exists())
             {
-                logger.debug("Removing snapshot directory {}", snapshotDir);
+                logger.trace("Removing snapshot directory {}", snapshotDir);
                 try
                 {
                     FileUtils.deleteRecursive(snapshotDir);
                 }
                 catch (FSWriteError e)
                 {
-                    if (FBUtilities.isWindows())
-                    {
-                        logger.warn("Failed to delete snapshot directory [{}]. Folder will be deleted on JVM shutdown or next node restart on crash. You can safely attempt to delete this folder but it will fail so long as readers are open on the files.", snapshotDir);
-                        WindowsFailedSnapshotTracker.handleFailedSnapshot(snapshotDir);
-                    }
+                    if (FBUtilities.isWindows)
+                        SnapshotDeletingTask.addFailedSnapshot(snapshotDir);
                     else
-                    {
                         throw e;
-                    }
                 }
             }
         }
@@ -841,12 +934,25 @@ public class Directories
         return result;
     }
 
+    /**
+     * @return Raw size on disk for all directories
+     */
+    public long getRawDiretoriesSize()
+    {
+        long totalAllocatedSize = 0L;
+
+        for (File path : dataPaths)
+            totalAllocatedSize += FileUtils.folderSize(path);
+
+        return totalAllocatedSize;
+    }
+
     public long getTrueAllocatedSizeIn(File input)
     {
         if (!input.isDirectory())
             return 0;
 
-        TrueFilesSizeVisitor visitor = new TrueFilesSizeVisitor();
+        SSTableSizeSummer visitor = new SSTableSizeSummer(input, sstableLister(Directories.OnTxnErr.THROW).listFiles());
         try
         {
             Files.walkFileTree(input.toPath(), visitor);
@@ -859,11 +965,17 @@ public class Directories
         return visitor.getAllocatedSize();
     }
 
-    // Recursively finds all the sub directories in the KS directory.
     public static List<File> getKSChildDirectories(String ksName)
     {
+        return getKSChildDirectories(ksName, dataDirectories);
+
+    }
+
+    // Recursively finds all the sub directories in the KS directory.
+    public static List<File> getKSChildDirectories(String ksName, DataDirectory[] directories)
+    {
         List<File> result = new ArrayList<>();
-        for (DataDirectory dataDirectory : dataDirectories)
+        for (DataDirectory dataDirectory : directories)
         {
             File ksDir = new File(dataDirectory.location, ksName);
             File[] cfDirs = ksDir.listFiles();
@@ -923,53 +1035,25 @@ public class Directories
         for (int i = 0; i < locations.length; ++i)
             dataDirectories[i] = new DataDirectory(new File(locations[i]));
     }
-    
-    private class TrueFilesSizeVisitor extends SimpleFileVisitor<Path>
-    {
-        private final AtomicLong size = new AtomicLong(0);
-        private final Set<String> visited = newHashSet(); //count each file only once
-        private final Set<String> alive;
 
-        TrueFilesSizeVisitor()
+    private class SSTableSizeSummer extends DirectorySizeCalculator
+    {
+        private final HashSet<File> toSkip;
+        SSTableSizeSummer(File path, List<File> files)
         {
-            super();
-            Builder<String> builder = ImmutableSet.builder();
-            for (File file : sstableLister(Directories.OnTxnErr.THROW).listFiles())
-                builder.add(file.getName());
-            alive = builder.build();
+            super(path);
+            toSkip = new HashSet<>(files);
         }
 
-        private boolean isAcceptable(Path file)
+        @Override
+        public boolean isAcceptable(Path path)
         {
-            String fileName = file.toFile().getName();
-            Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParent().toFile(), fileName);
+            File file = path.toFile();
+            Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(path.getParent().toFile(), file.getName());
             return pair != null
                     && pair.left.ksname.equals(metadata.ksName)
                     && pair.left.cfname.equals(metadata.cfName)
-                    && !visited.contains(fileName)
-                    && !alive.contains(fileName);
-        }
-
-        @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
-        {
-            if (isAcceptable(file))
-            {
-                size.addAndGet(attrs.size());
-                visited.add(file.toFile().getName());
-            }
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException 
-        {
-            return FileVisitResult.CONTINUE;
-        }
-        
-        public long getAllocatedSize()
-        {
-            return size.get();
+                    && !toSkip.contains(file);
         }
     }
 }

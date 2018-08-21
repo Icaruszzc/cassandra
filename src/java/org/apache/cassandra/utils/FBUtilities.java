@@ -29,22 +29,36 @@ import java.util.concurrent.*;
 import java.util.zip.CRC32;
 import java.util.zip.Checksum;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
+import com.google.common.base.Strings;
+import com.google.common.util.concurrent.Uninterruptibles;
+
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.auth.IAuthorizer;
 import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.IVersionedSerializer;
-import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
+import org.apache.cassandra.io.sstable.metadata.MetadataType;
+import org.apache.cassandra.io.sstable.metadata.ValidationMetadata;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.io.util.FileUtils;
@@ -63,34 +77,28 @@ public class FBUtilities
     private static final String DEFAULT_TRIGGER_DIR = "triggers";
 
     private static final String OPERATING_SYSTEM = System.getProperty("os.name").toLowerCase();
-    private static final boolean IS_WINDOWS = OPERATING_SYSTEM.contains("windows");
-    private static final boolean HAS_PROCFS = !IS_WINDOWS && (new File(File.separator + "proc")).exists();
+    public static final boolean isWindows = OPERATING_SYSTEM.contains("windows");
+    public static final boolean isLinux = OPERATING_SYSTEM.contains("linux");
 
     private static volatile InetAddress localInetAddress;
     private static volatile InetAddress broadcastInetAddress;
+    private static volatile InetAddress broadcastRpcAddress;
 
     public static int getAvailableProcessors()
     {
-        if (System.getProperty("cassandra.available_processors") != null)
-            return Integer.parseInt(System.getProperty("cassandra.available_processors"));
+        String availableProcessors = System.getProperty("cassandra.available_processors");
+        if (!Strings.isNullOrEmpty(availableProcessors))
+            return Integer.parseInt(availableProcessors);
         else
             return Runtime.getRuntime().availableProcessors();
     }
 
-    private static final ThreadLocal<MessageDigest> localMD5Digest = new ThreadLocal<MessageDigest>()
+    private static final FastThreadLocal<MessageDigest> localMD5Digest = new FastThreadLocal<MessageDigest>()
     {
         @Override
         protected MessageDigest initialValue()
         {
             return newMessageDigest("MD5");
-        }
-
-        @Override
-        public MessageDigest get()
-        {
-            MessageDigest digest = super.get();
-            digest.reset();
-            return digest;
         }
     };
 
@@ -98,7 +106,9 @@ public class FBUtilities
 
     public static MessageDigest threadLocalMD5Digest()
     {
-        return localMD5Digest.get();
+        MessageDigest md = localMD5Digest.get();
+        md.reset();
+        return md;
     }
 
     public static MessageDigest newMessageDigest(String algorithm)
@@ -141,6 +151,16 @@ public class FBUtilities
         return broadcastInetAddress;
     }
 
+
+    public static InetAddress getBroadcastRpcAddress()
+    {
+        if (broadcastRpcAddress == null)
+            broadcastRpcAddress = DatabaseDescriptor.getBroadcastRpcAddress() == null
+                                   ? DatabaseDescriptor.getRpcAddress()
+                                   : DatabaseDescriptor.getBroadcastRpcAddress();
+        return broadcastRpcAddress;
+    }
+
     public static Collection<InetAddress> getAllLocalAddresses()
     {
         Set<InetAddress> localAddresses = new HashSet<InetAddress>();
@@ -158,6 +178,26 @@ public class FBUtilities
             throw new AssertionError(e);
         }
         return localAddresses;
+    }
+
+    public static String getNetworkInterface(InetAddress localAddress)
+    {
+        try
+        {
+            for(NetworkInterface ifc : Collections.list(NetworkInterface.getNetworkInterfaces()))
+            {
+                if(ifc.isUp())
+                {
+                    for(InetAddress addr : Collections.list(ifc.getInetAddresses()))
+                    {
+                        if (addr.equals(localAddress))
+                            return ifc.getDisplayName();
+                    }
+                }
+            }
+        }
+        catch (SocketException e) {}
+        return null;
     }
 
     /**
@@ -223,25 +263,6 @@ public class FBUtilities
             out[i] = (byte)((left[i] & 0xFF) ^ (right[i] & 0xFF));
         }
         return out;
-    }
-
-    public static byte[] hash(ByteBuffer... data)
-    {
-        MessageDigest messageDigest = localMD5Digest.get();
-        for (ByteBuffer block : data)
-        {
-            if (block.hasArray())
-                messageDigest.update(block.array(), block.arrayOffset() + block.position(), block.remaining());
-            else
-                messageDigest.update(block.duplicate());
-        }
-
-        return messageDigest.digest();
-    }
-
-    public static BigInteger hashToBigInteger(ByteBuffer data)
-    {
-        return new BigInteger(hash(data)).abs();
     }
 
     public static void sortSampledKeys(List<DecoratedKey> keys, Range<Token> range)
@@ -335,10 +356,23 @@ public class FBUtilities
         return (int) (System.currentTimeMillis() / 1000);
     }
 
-    public static void waitOnFutures(Iterable<Future<?>> futures)
+    public static <T> List<T> waitOnFutures(Iterable<? extends Future<? extends T>> futures)
     {
-        for (Future f : futures)
-            waitOnFuture(f);
+        List<T> results = new ArrayList<>();
+        Throwable fail = null;
+        for (Future<? extends T> f : futures)
+        {
+            try
+            {
+                results.add(f.get());
+            }
+            catch (Throwable t)
+            {
+                fail = Throwables.merge(fail, t);
+            }
+        }
+        Throwables.maybeFail(fail);
+        return results;
     }
 
     public static <T> T waitOnFuture(Future<T> future)
@@ -363,10 +397,72 @@ public class FBUtilities
             result.get(ms, TimeUnit.MILLISECONDS);
     }
 
+    public static <T> Future<? extends T> waitOnFirstFuture(Iterable<? extends Future<? extends T>> futures)
+    {
+        return waitOnFirstFuture(futures, 100);
+    }
+    /**
+     * Only wait for the first future to finish from a list of futures. Will block until at least 1 future finishes.
+     * @param futures The futures to wait on
+     * @return future that completed.
+     */
+    public static <T> Future<? extends T> waitOnFirstFuture(Iterable<? extends Future<? extends T>> futures, long delay)
+    {
+        while (true)
+        {
+            for (Future<? extends T> f : futures)
+            {
+                if (f.isDone())
+                {
+                    try
+                    {
+                        f.get();
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new AssertionError(e);
+                    }
+                    catch (ExecutionException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                    return f;
+                }
+            }
+            Uninterruptibles.sleepUninterruptibly(delay, TimeUnit.MILLISECONDS);
+        }
+    }
+    /**
+     * Create a new instance of a partitioner defined in an SSTable Descriptor
+     * @param desc Descriptor of an sstable
+     * @return a new IPartitioner instance
+     * @throws IOException
+     */
+    public static IPartitioner newPartitioner(Descriptor desc) throws IOException
+    {
+        EnumSet<MetadataType> types = EnumSet.of(MetadataType.VALIDATION, MetadataType.HEADER);
+        Map<MetadataType, MetadataComponent> sstableMetadata = desc.getMetadataSerializer().deserialize(desc, types);
+        ValidationMetadata validationMetadata = (ValidationMetadata) sstableMetadata.get(MetadataType.VALIDATION);
+        SerializationHeader.Component header = (SerializationHeader.Component) sstableMetadata.get(MetadataType.HEADER);
+        return newPartitioner(validationMetadata.partitioner, Optional.of(header.getKeyType()));
+    }
+
     public static IPartitioner newPartitioner(String partitionerClassName) throws ConfigurationException
+    {
+        return newPartitioner(partitionerClassName, Optional.empty());
+    }
+
+    @VisibleForTesting
+    static IPartitioner newPartitioner(String partitionerClassName, Optional<AbstractType<?>> comparator) throws ConfigurationException
     {
         if (!partitionerClassName.contains("."))
             partitionerClassName = "org.apache.cassandra.dht." + partitionerClassName;
+
+        if (partitionerClassName.equals("org.apache.cassandra.dht.LocalPartitioner"))
+        {
+            assert comparator.isPresent() : "Expected a comparator for local partitioner";
+            return new LocalPartitioner(comparator.get());
+        }
         return FBUtilities.instanceOrConstruct(partitionerClassName, "partitioner");
     }
 
@@ -477,8 +573,18 @@ public class FBUtilities
         return new TreeSet<T>(comparator);
     }
 
-    public static String toString(Map<?,?> map)
+    /**
+     * Make straing out of the given {@code Map}.
+     *
+     * @param map Map to make string.
+     * @return String representation of all entries in the map,
+     *         where key and value pair is concatenated with ':'.
+     */
+    @Nonnull
+    public static String toString(@Nullable Map<?, ?> map)
     {
+        if (map == null)
+            return "";
         Joiner.MapJoiner joiner = Joiner.on(", ").withKeyValueSeparator(":");
         return joiner.join(map);
     }
@@ -546,11 +652,36 @@ public class FBUtilities
 
     public static String prettyPrintMemory(long size)
     {
+        return prettyPrintMemory(size, false);
+    }
+
+    public static String prettyPrintMemory(long size, boolean includeSpace)
+    {
         if (size >= 1 << 30)
-            return String.format("%.3fGiB", size / (double) (1 << 30));
+            return String.format("%.3f%sGiB", size / (double) (1 << 30), includeSpace ? " " : "");
         if (size >= 1 << 20)
-            return String.format("%.3fMiB", size / (double) (1 << 20));
-        return String.format("%.3fKiB", size / (double) (1 << 10));
+            return String.format("%.3f%sMiB", size / (double) (1 << 20), includeSpace ? " " : "");
+        return String.format("%.3f%sKiB", size / (double) (1 << 10), includeSpace ? " " : "");
+    }
+
+    public static String prettyPrintMemoryPerSecond(long rate)
+    {
+        if (rate >= 1 << 30)
+            return String.format("%.3fGiB/s", rate / (double) (1 << 30));
+        if (rate >= 1 << 20)
+            return String.format("%.3fMiB/s", rate / (double) (1 << 20));
+        return String.format("%.3fKiB/s", rate / (double) (1 << 10));
+    }
+
+    public static String prettyPrintMemoryPerSecond(long bytes, long timeInNano)
+    {
+        // We can't sanely calculate a rate over 0 nanoseconds
+        if (timeInNano == 0)
+            return "NaN  KiB/s";
+
+        long rate = (long) (((double) bytes / timeInNano) * 1000 * 1000 * 1000);
+
+        return prettyPrintMemoryPerSecond(rate);
     }
 
     /**
@@ -621,20 +752,6 @@ public class FBUtilities
         int position = buffer.position();
         checksum.update(buffer);
         buffer.position(position);
-    }
-
-    private static final ThreadLocal<byte[]> threadLocalScratchBuffer = new ThreadLocal<byte[]>()
-    {
-        @Override
-        protected byte[] initialValue()
-        {
-            return new byte[CompressionParams.DEFAULT_CHUNK_LENGTH];
-        }
-    };
-
-    public static byte[] getThreadLocalScratchBuffer()
-    {
-        return threadLocalScratchBuffer.get();
     }
 
     public static long abs(long index)
@@ -708,16 +825,6 @@ public class FBUtilities
         return historyDir;
     }
 
-    public static boolean isWindows()
-    {
-        return IS_WINDOWS;
-    }
-
-    public static boolean hasProcFS()
-    {
-        return HAS_PROCFS;
-    }
-
     public static void updateWithShort(MessageDigest digest, int val)
     {
         digest.update((byte) ((val >> 8) & 0xFF));
@@ -773,5 +880,46 @@ public class FBUtilities
         }
         if (toThrow != null)
             throw toThrow;
+    }
+
+    public static byte[] toWriteUTFBytes(String s)
+    {
+        try
+        {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(baos);
+            dos.writeUTF(s);
+            dos.flush();
+            return baos.toByteArray();
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+	public static void sleepQuietly(long millis)
+    {
+        try
+        {
+            Thread.sleep(millis);
+        }
+        catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static long align(long val, int boundary)
+    {
+        return (val + boundary) & ~(boundary - 1);
+    }
+
+    @VisibleForTesting
+    protected static void reset()
+    {
+        localInetAddress = null;
+        broadcastInetAddress = null;
+        broadcastRpcAddress = null;
     }
 }

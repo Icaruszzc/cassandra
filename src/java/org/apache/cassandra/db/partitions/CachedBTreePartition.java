@@ -41,7 +41,6 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
 
     private CachedBTreePartition(CFMetaData metadata,
                                  DecoratedKey partitionKey,
-                                 PartitionColumns columns,
                                  Holder holder,
                                  int createdAtInSec,
                                  int cachedLiveRows,
@@ -49,7 +48,7 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
                                  int nonTombstoneCellCount,
                                  int nonExpiringLiveCells)
     {
-        super(metadata, partitionKey, columns, holder);
+        super(metadata, partitionKey, holder);
         this.createdAtInSec = createdAtInSec;
         this.cachedLiveRows = cachedLiveRows;
         this.rowsWithNonExpiringCells = rowsWithNonExpiringCells;
@@ -92,10 +91,11 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
         int rowsWithNonExpiringCells = 0;
         int nonTombstoneCellCount = 0;
         int nonExpiringLiveCells = 0;
+        boolean enforceStrictLiveness = iterator.metadata().enforceStrictLiveness();
 
         for (Row row : BTree.<Row>iterable(holder.tree))
         {
-            if (row.hasLiveData(nowInSec))
+            if (row.hasLiveData(nowInSec, enforceStrictLiveness))
                 ++cachedLiveRows;
 
             int nonExpiringLiveCellsThisRow = 0;
@@ -118,7 +118,6 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
 
         return new CachedBTreePartition(iterator.metadata(),
                                         iterator.partitionKey(),
-                                        iterator.columns(),
                                         holder,
                                         nowInSec,
                                         cachedLiveRows,
@@ -216,7 +215,6 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
 
             return new CachedBTreePartition(metadata,
                                                   header.key,
-                                                  header.sHeader.columns(),
                                                   holder,
                                                   createdAtInSec,
                                                   cachedLiveRows,

@@ -35,6 +35,7 @@ import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.thrift.ThriftValidation;
 import org.apache.cassandra.transport.Event;
 
@@ -48,7 +49,6 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
     private final List<CQL3Type.Raw> argRawTypes;
     private final boolean argsPresent;
 
-    private Function old;
     private List<AbstractType<?>> argTypes;
 
     public DropFunctionStatement(FunctionName functionName,
@@ -63,22 +63,26 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
     }
 
     @Override
-    public Prepared prepare() throws InvalidRequestException
+    public Prepared prepare(ClientState clientState) throws InvalidRequestException
     {
-        argTypes = new ArrayList<>(argRawTypes.size());
-        for (CQL3Type.Raw rawType : argRawTypes)
+        if (Schema.instance.getKSMetaData(functionName.keyspace) != null)
         {
-            if (rawType.isFrozen())
-                throw new InvalidRequestException("The function arguments should not be frozen; remove the frozen<> modifier");
+            argTypes = new ArrayList<>(argRawTypes.size());
+            for (CQL3Type.Raw rawType : argRawTypes)
+            {
+                if (rawType.isFrozen())
+                    throw new InvalidRequestException("The function arguments should not be frozen; remove the frozen<> modifier");
 
-            // UDT are not supported non frozen but we do not allow the frozen keyword for argument. So for the moment we
-            // freeze them here
-            if (!rawType.canBeNonFrozen())
-                rawType.freeze();
+                // UDT are not supported non frozen but we do not allow the frozen keyword for argument. So for the moment we
+                // freeze them here
+                if (!rawType.canBeNonFrozen())
+                    rawType.freeze();
 
-            argTypes.add(rawType.prepare(functionName.keyspace).getType());
+                argTypes.add(rawType.prepare(functionName.keyspace).getType());
+            }
         }
-        return super.prepare();
+
+        return super.prepare(clientState);
     }
 
     @Override
@@ -93,7 +97,6 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
         ThriftValidation.validateKeyspaceNotSystem(functionName.keyspace);
     }
 
-    @Override
     public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException
     {
         Function function = findFunction();
@@ -113,7 +116,6 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
         }
     }
 
-    @Override
     public void validate(ClientState state)
     {
         Collection<Function> olds = Schema.instance.getFunctions(functionName);
@@ -126,21 +128,13 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
                                                             functionName, functionName, functionName));
     }
 
-    @Override
-    public Event.SchemaChange changeEvent()
+    public Event.SchemaChange announceMigration(QueryState queryState, boolean isLocalOnly) throws RequestValidationException
     {
-        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.FUNCTION,
-                                      old.name().keyspace, old.name().name, AbstractType.asCQLTypeStringList(old.argTypes()));
-    }
-
-    @Override
-    public boolean announceMigration(boolean isLocalOnly) throws RequestValidationException
-    {
-        old = findFunction();
+        Function old = findFunction();
         if (old == null)
         {
             if (ifExists)
-                return false;
+                return null;
             else
                 throw new InvalidRequestException(getMissingFunctionError());
         }
@@ -152,7 +146,8 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
 
         MigrationManager.announceFunctionDrop((UDFunction) old, isLocalOnly);
 
-        return true;
+        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.FUNCTION,
+                                      old.name().keyspace, old.name().name, AbstractType.asCQLTypeStringList(old.argTypes()));
     }
 
     private String getMissingFunctionError()
@@ -171,6 +166,11 @@ public final class DropFunctionStatement extends SchemaAlteringStatement
         Function old;
         if (argsPresent)
         {
+            if (argTypes == null)
+            {
+                return null;
+            }
+
             old = Schema.instance.findFunction(functionName, argTypes).orElse(null);
             if (old == null || !(old instanceof ScalarFunction))
             {

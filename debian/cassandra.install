@@ -5,6 +5,8 @@ conf/commitlog_archiving.properties etc/cassandra
 conf/cassandra-topology.properties etc/cassandra
 conf/logback.xml etc/cassandra
 conf/logback-tools.xml etc/cassandra
+conf/jvm.options etc/cassandra
+conf/hotspot_compiler etc/cassandra
 conf/triggers/* etc/cassandra/triggers
 debian/cassandra.in.sh usr/share/cassandra
 debian/cassandra.conf etc/security/limits.d
@@ -17,6 +19,7 @@ bin/cqlsh usr/bin
 bin/cqlsh.py usr/bin
 bin/sstablescrub usr/bin
 bin/sstableupgrade usr/bin
+bin/sstableverify usr/bin
 tools/bin/cassandra-stress usr/bin
 lib/*.jar usr/share/cassandra/lib
 lib/*.zip usr/share/cassandra/lib

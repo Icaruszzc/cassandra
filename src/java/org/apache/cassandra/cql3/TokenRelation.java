@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Joiner;
 
@@ -46,11 +47,11 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.invalidReq
  */
 public final class TokenRelation extends Relation
 {
-    private final List<ColumnIdentifier.Raw> entities;
+    private final List<ColumnDefinition.Raw> entities;
 
     private final Term.Raw value;
 
-    public TokenRelation(List<ColumnIdentifier.Raw> entities, Operator type, Term.Raw value)
+    public TokenRelation(List<ColumnDefinition.Raw> entities, Operator type, Term.Raw value)
     {
         this.entities = entities;
         this.relationType = type;
@@ -61,6 +62,16 @@ public final class TokenRelation extends Relation
     public boolean onToken()
     {
         return true;
+    }
+
+    public Term.Raw getValue()
+    {
+        return value;
+    }
+
+    public List<? extends Term.Raw> getInValues()
+    {
+        return null;
     }
 
     @Override
@@ -95,6 +106,18 @@ public final class TokenRelation extends Relation
     }
 
     @Override
+    protected Restriction newIsNotRestriction(CFMetaData cfm, VariableSpecifications boundNames) throws InvalidRequestException
+    {
+        throw invalidRequest("%s cannot be used with the token function", operator());
+    }
+
+    @Override
+    protected Restriction newLikeRestriction(CFMetaData cfm, VariableSpecifications boundNames, Operator operator) throws InvalidRequestException
+    {
+        throw invalidRequest("%s cannot be used with the token function", operator);
+    }
+
+    @Override
     protected Term toTerm(List<? extends ColumnSpecification> receivers,
                           Raw raw,
                           String keyspace,
@@ -103,6 +126,15 @@ public final class TokenRelation extends Relation
         Term term = raw.prepare(keyspace, receivers.get(0));
         term.collectMarkerSpecification(boundNames);
         return term;
+    }
+
+    public Relation renameIdentifier(ColumnDefinition.Raw from, ColumnDefinition.Raw to)
+    {
+        if (!entities.contains(from))
+            return this;
+
+        List<ColumnDefinition.Raw> newEntities = entities.stream().map(e -> e.equals(from) ? to : e).collect(Collectors.toList());
+        return new TokenRelation(newEntities, operator(), value);
     }
 
     @Override
@@ -120,11 +152,9 @@ public final class TokenRelation extends Relation
      */
     private List<ColumnDefinition> getColumnDefinitions(CFMetaData cfm) throws InvalidRequestException
     {
-        List<ColumnDefinition> columnDefs = new ArrayList<>();
-        for ( ColumnIdentifier.Raw raw : entities)
-        {
-            columnDefs.add(toColumnDefinition(cfm, raw));
-        }
+        List<ColumnDefinition> columnDefs = new ArrayList<>(entities.size());
+        for ( ColumnDefinition.Raw raw : entities)
+            columnDefs.add(raw.prepare(cfm));
         return columnDefs;
     }
 

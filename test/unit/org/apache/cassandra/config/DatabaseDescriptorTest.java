@@ -23,6 +23,8 @@ import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Enumeration;
 
 import org.junit.BeforeClass;
@@ -43,16 +45,24 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
+import static org.junit.Assert.assertTrue;
+
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class DatabaseDescriptorTest
 {
+    @BeforeClass
+    public static void setupDatabaseDescriptor()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testCFMetaDataSerialization() throws ConfigurationException, InvalidRequestException
     {
         // test serialization of all defined test CFs.
         for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
         {
-            for (CFMetaData cfm : Schema.instance.getTables(keyspaceName))
+            for (CFMetaData cfm : Schema.instance.getTablesAndViews(keyspaceName))
             {
                 CFMetaData cfmDupe = ThriftConversion.fromThrift(ThriftConversion.toThrift(cfm));
                 assertNotNull(cfmDupe);
@@ -264,5 +274,16 @@ public class DatabaseDescriptorTest
         testConfig.rpc_interface = null;
         DatabaseDescriptor.applyAddressConfig(testConfig);
 
+    }
+    
+    @Test
+    public void testTokensFromString()
+    {
+        assertTrue(DatabaseDescriptor.tokensFromString(null).isEmpty());
+        Collection<String> tokens = DatabaseDescriptor.tokensFromString(" a,b ,c , d, f,g,h");
+        assertEquals(7, tokens.size());
+        assertTrue(tokens.containsAll(Arrays.asList(new String[]{"a", "b", "c", "d", "f", "g", "h"})));
+
+        
     }
 }

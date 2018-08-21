@@ -26,20 +26,21 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.DecimalSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class DecimalType extends AbstractType<BigDecimal>
 {
     public static final DecimalType instance = new DecimalType();
 
-    DecimalType() {} // singleton
+    DecimalType() {super(ComparisonType.CUSTOM);} // singleton
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         if (!o1.hasRemaining() || !o2.hasRemaining())
             return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
@@ -80,7 +81,7 @@ public class DecimalType extends AbstractType<BigDecimal>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return getSerializer().deserialize(buffer).toString();
     }

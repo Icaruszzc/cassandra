@@ -64,6 +64,7 @@ public class NodeTool
                 Verify.class,
                 Flush.class,
                 UpgradeSSTable.class,
+                GarbageCollect.class,
                 DisableAutoCompaction.class,
                 EnableAutoCompaction.class,
                 CompactionStats.class,
@@ -79,7 +80,10 @@ public class NodeTool
                 GcStats.class,
                 GetCompactionThreshold.class,
                 GetCompactionThroughput.class,
+                GetTimeout.class,
                 GetStreamThroughput.class,
+                GetTraceProbability.class,
+                GetInterDCStreamThroughput.class,
                 GetEndpoints.class,
                 GetSSTables.class,
                 GossipInfo.class,
@@ -101,7 +105,11 @@ public class NodeTool
                 SetHintedHandoffThrottleInKB.class,
                 SetCompactionThreshold.class,
                 SetCompactionThroughput.class,
+                GetConcurrentCompactors.class,
+                SetConcurrentCompactors.class,
+                SetTimeout.class,
                 SetStreamThroughput.class,
+                SetInterDCStreamThroughput.class,
                 SetTraceProbability.class,
                 Snapshot.class,
                 ListSnapshots.class,
@@ -120,6 +128,7 @@ public class NodeTool
                 EnableBackup.class,
                 DisableBackup.class,
                 ResetLocalSchema.class,
+                ReloadLocalSchema.class,
                 ReloadTriggers.class,
                 SetCacheKeysToSave.class,
                 DisableThrift.class,
@@ -131,7 +140,11 @@ public class NodeTool
                 SetLoggingLevel.class,
                 GetLoggingLevels.class,
                 DisableHintsForDC.class,
-                EnableHintsForDC.class
+                EnableHintsForDC.class,
+                FailureDetectorInfo.class,
+                RefreshSizeEstimates.class,
+                RelocateSSTables.class,
+                ViewBuildStatus.class
         );
 
         Cli.CliBuilder<Runnable> builder = Cli.builder("nodetool");
@@ -300,7 +313,7 @@ public class NodeTool
                     nodeClient = new NodeProbe(host, parseInt(port));
                 else
                     nodeClient = new NodeProbe(host, parseInt(port), username, password);
-            } catch (IOException e)
+            } catch (IOException | SecurityException e)
             {
                 Throwable rootCause = Throwables.getRootCause(e);
                 System.err.println(format("nodetool: Failed to connect to '%s:%s' - %s: '%s'.", host, port, rootCause.getClass().getSimpleName(), rootCause.getMessage()));
@@ -310,19 +323,34 @@ public class NodeTool
             return nodeClient;
         }
 
-        protected List<String> parseOptionalKeyspace(List<String> cmdArgs, NodeProbe nodeProbe)
+        protected enum KeyspaceSet
         {
-            return parseOptionalKeyspace(cmdArgs, nodeProbe, false);
+            ALL, NON_SYSTEM, NON_LOCAL_STRATEGY
         }
 
-        protected List<String> parseOptionalKeyspace(List<String> cmdArgs, NodeProbe nodeProbe, boolean includeSystemKS)
+        protected List<String> parseOptionalKeyspace(List<String> cmdArgs, NodeProbe nodeProbe)
+        {
+            return parseOptionalKeyspace(cmdArgs, nodeProbe, KeyspaceSet.ALL);
+        }
+
+        protected List<String> parseOptionalKeyspace(List<String> cmdArgs, NodeProbe nodeProbe, KeyspaceSet defaultKeyspaceSet)
         {
             List<String> keyspaces = new ArrayList<>();
 
+
             if (cmdArgs == null || cmdArgs.isEmpty())
-                keyspaces.addAll(includeSystemKS ? nodeProbe.getKeyspaces() : nodeProbe.getNonSystemKeyspaces());
+            {
+                if (defaultKeyspaceSet == KeyspaceSet.NON_LOCAL_STRATEGY)
+                    keyspaces.addAll(keyspaces = nodeProbe.getNonLocalStrategyKeyspaces());
+                else if (defaultKeyspaceSet == KeyspaceSet.NON_SYSTEM)
+                    keyspaces.addAll(keyspaces = nodeProbe.getNonSystemKeyspaces());
+                else
+                    keyspaces.addAll(nodeProbe.getKeyspaces());
+            }
             else
+            {
                 keyspaces.add(cmdArgs.get(0));
+            }
 
             for (String keyspace : keyspaces)
             {
@@ -339,11 +367,11 @@ public class NodeTool
         }
     }
 
-    public static Map<String, SetHostStat> getOwnershipByDc(NodeProbe probe, boolean resolveIp,
-                                                             Map<String, String> tokenToEndpoint,
-                                                             Map<InetAddress, Float> ownerships)
+    public static SortedMap<String, SetHostStat> getOwnershipByDc(NodeProbe probe, boolean resolveIp,
+                                                                  Map<String, String> tokenToEndpoint,
+                                                                  Map<InetAddress, Float> ownerships)
     {
-        Map<String, SetHostStat> ownershipByDc = Maps.newLinkedHashMap();
+        SortedMap<String, SetHostStat> ownershipByDc = Maps.newTreeMap();
         EndpointSnitchInfoMBean epSnitchInfo = probe.getEndpointSnitchInfoProxy();
         try
         {

@@ -26,7 +26,7 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.file.StandardOpenOption;
 
 import org.apache.cassandra.io.FSReadError;
-import org.apache.cassandra.utils.CLibrary;
+import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.concurrent.RefCounted;
 import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
 
@@ -63,7 +63,7 @@ public final class ChannelProxy extends SharedCloseableImpl
 
     public ChannelProxy(File file)
     {
-        this(file.getAbsolutePath(), openChannel(file));
+        this(file.getPath(), openChannel(file));
     }
 
     public ChannelProxy(String filePath, FileChannel channel)
@@ -87,7 +87,7 @@ public final class ChannelProxy extends SharedCloseableImpl
         final String filePath;
         final FileChannel channel;
 
-        protected Cleanup(String filePath, FileChannel channel)
+        Cleanup(String filePath, FileChannel channel)
         {
             this.filePath = filePath;
             this.channel = channel;
@@ -125,6 +125,7 @@ public final class ChannelProxy extends SharedCloseableImpl
     {
         try
         {
+            // FIXME: consider wrapping in a while loop
             return channel.read(buffer, position);
         }
         catch (IOException e)
@@ -171,7 +172,7 @@ public final class ChannelProxy extends SharedCloseableImpl
 
     public int getFileDescriptor()
     {
-        return CLibrary.getfd(channel);
+        return NativeLibrary.getfd(channel);
     }
 
     @Override

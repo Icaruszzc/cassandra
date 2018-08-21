@@ -58,6 +58,7 @@ public class Validator implements Runnable
     public final RepairJobDesc desc;
     public final InetAddress initiator;
     public final int gcBefore;
+    private final boolean evenTreeDistribution;
 
     // null when all rows with the min token have been consumed
     private long validated;
@@ -71,28 +72,36 @@ public class Validator implements Runnable
 
     public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore)
     {
+        this(desc, initiator, gcBefore, false);
+    }
+
+    public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore, boolean evenTreeDistribution)
+    {
         this.desc = desc;
         this.initiator = initiator;
         this.gcBefore = gcBefore;
         validated = 0;
         range = null;
         ranges = null;
+        this.evenTreeDistribution = evenTreeDistribution;
     }
 
     public void prepare(ColumnFamilyStore cfs, MerkleTrees tree)
     {
         this.trees = tree;
 
-        if (!tree.partitioner().preservesOrder())
+        if (!tree.partitioner().preservesOrder() || evenTreeDistribution)
         {
             // You can't beat an even tree distribution for md5
             tree.init();
         }
         else
         {
+            List<DecoratedKey> keys = new ArrayList<>();
+            Random random = new Random();
+
             for (Range<Token> range : tree.ranges())
             {
-                List<DecoratedKey> keys = new ArrayList<>();
                 for (DecoratedKey sample : cfs.keySamples(range))
                 {
                     assert range.contains(sample.getToken()) : "Token " + sample.getToken() + " is not within range " + desc.ranges;
@@ -107,7 +116,6 @@ public class Validator implements Runnable
                 else
                 {
                     int numKeys = keys.size();
-                    Random random = new Random();
                     // sample the column family using random keys from the index
                     while (true)
                     {
@@ -115,6 +123,7 @@ public class Validator implements Runnable
                         if (!tree.split(dk.getToken()))
                             break;
                     }
+                    keys.clear();
                 }
             }
         }
@@ -126,7 +135,7 @@ public class Validator implements Runnable
      * Called (in order) for every row present in the CF.
      * Hashes the row, and adds it to the tree being built.
      *
-     * @param row Row to add hash
+     * @param partition Partition to add hash
      */
     public void add(UnfilteredRowIterator partition)
     {
@@ -209,7 +218,7 @@ public class Validator implements Runnable
         validated++;
         // MerkleTree uses XOR internally, so we want lots of output bits here
         CountingDigest digest = new CountingDigest(FBUtilities.newMessageDigest("SHA-256"));
-        UnfilteredRowIterators.digest(partition, digest);
+        UnfilteredRowIterators.digest(null, partition, digest, MessagingService.current_version);
         // only return new hash for merkle tree in case digest was updated - see CASSANDRA-8979
         return digest.count > 0
              ? new MerkleTree.RowHash(partition.partitionKey().getToken(), digest.digest(), digest.count)
@@ -269,7 +278,7 @@ public class Validator implements Runnable
         // respond to the request that triggered this validation
         if (!initiator.equals(FBUtilities.getBroadcastAddress()))
         {
-            logger.info(String.format("[repair #%s] Sending completed merkle tree to %s for %s.%s", desc.sessionId, initiator, desc.keyspace, desc.columnFamily));
+            logger.info("[repair #{}] Sending completed merkle tree to {} for {}.{}", desc.sessionId, initiator, desc.keyspace, desc.columnFamily);
             Tracing.traceRepair("Sending completed merkle tree to {} for {}.{}", initiator, desc.keyspace, desc.columnFamily);
         }
         MessagingService.instance().sendOneWay(new ValidationComplete(desc, trees).createMessage(), initiator);

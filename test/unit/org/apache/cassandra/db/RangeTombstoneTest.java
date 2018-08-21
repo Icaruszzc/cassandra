@@ -19,9 +19,7 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
@@ -78,6 +76,7 @@ public class RangeTombstoneTest
     {
         Keyspace keyspace = Keyspace.open(KSNAME);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CFNAME);
+        boolean enforceStrictLiveness = cfs.metadata.enforceStrictLiveness();
 
         // Inserting data
         String key = "k1";
@@ -114,17 +113,21 @@ public class RangeTombstoneTest
         int nowInSec = FBUtilities.nowInSeconds();
 
         for (int i : live)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live",
+                       partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
         for (int i : dead)
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live",
+                        partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
 
         // Queries by slices
         partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).fromIncl(7).toIncl(30).build());
 
         for (int i : new int[]{ 7, 8, 9, 11, 13, 15, 17, 28, 29, 30 })
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live",
+                       partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
         for (int i : new int[]{ 10, 12, 14, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 })
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live",
+                        partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
     }
 
     @Test
@@ -209,10 +212,10 @@ public class RangeTombstoneTest
         assertEquals(1, rt.size());
 
         Slices.Builder sb = new Slices.Builder(cfs.getComparator());
-        sb.add(Slice.Bound.create(cfs.getComparator(), true, true, 1), Slice.Bound.create(cfs.getComparator(), false, true, 10));
-        sb.add(Slice.Bound.create(cfs.getComparator(), true, true, 16), Slice.Bound.create(cfs.getComparator(), false, true, 20));
+        sb.add(ClusteringBound.create(cfs.getComparator(), true, true, 1), ClusteringBound.create(cfs.getComparator(), false, true, 10));
+        sb.add(ClusteringBound.create(cfs.getComparator(), true, true, 16), ClusteringBound.create(cfs.getComparator(), false, true, 20));
 
-        partition = Util.getOnlyPartitionUnfiltered(SinglePartitionSliceCommand.create(cfs.metadata, FBUtilities.nowInSeconds(), Util.dk(key), sb.build()));
+        partition = Util.getOnlyPartitionUnfiltered(SinglePartitionReadCommand.create(cfs.metadata, FBUtilities.nowInSeconds(), Util.dk(key), sb.build()));
         rt = rangeTombstones(partition);
         assertEquals(2, rt.size());
     }
@@ -387,7 +390,7 @@ public class RangeTombstoneTest
         CompactionManager.instance.disableAutoCompaction();
         Keyspace keyspace = Keyspace.open(KSNAME);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CFNAME);
-
+        boolean enforceStrictLiveness = cfs.metadata.enforceStrictLiveness();
         // Inserting data
         String key = "k2";
 
@@ -410,22 +413,30 @@ public class RangeTombstoneTest
         int nowInSec = FBUtilities.nowInSeconds();
 
         for (int i = 0; i < 5; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live",
+                       partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
         for (int i = 16; i < 20; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertTrue("Row " + i + " should be live",
+                       partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
         for (int i = 5; i <= 15; i++)
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live",
+                        partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
 
         // Compact everything and re-test
         CompactionManager.instance.performMaximal(cfs, false);
         partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
 
         for (int i = 0; i < 5; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(FBUtilities.nowInSeconds()));
+            assertTrue("Row " + i + " should be live",
+                       partition.getRow(Clustering.make(bb(i))).hasLiveData(FBUtilities.nowInSeconds(),
+                                                                            enforceStrictLiveness));
         for (int i = 16; i < 20; i++)
-            assertTrue("Row " + i + " should be live", partition.getRow(new Clustering(bb(i))).hasLiveData(FBUtilities.nowInSeconds()));
+            assertTrue("Row " + i + " should be live",
+                       partition.getRow(Clustering.make(bb(i))).hasLiveData(FBUtilities.nowInSeconds(),
+                                                                            enforceStrictLiveness));
         for (int i = 5; i <= 15; i++)
-            assertFalse("Row " + i + " shouldn't be live", partition.getRow(new Clustering(bb(i))).hasLiveData(nowInSec));
+            assertFalse("Row " + i + " shouldn't be live",
+                        partition.getRow(Clustering.make(bb(i))).hasLiveData(nowInSec, enforceStrictLiveness));
     }
 
     @Test
@@ -464,11 +475,13 @@ public class RangeTombstoneTest
         cfs.disableAutoCompaction();
 
         ColumnDefinition cd = cfs.metadata.getColumnDefinition(indexedColumnName).copy();
-        IndexMetadata indexDef = IndexMetadata.singleColumnIndex(cd,
-                                                                 "test_index",
-                                                                 IndexMetadata.IndexType.CUSTOM,
-                                                                 ImmutableMap.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME,
-                                                                                 StubIndex.class.getName()));
+        IndexMetadata indexDef =
+            IndexMetadata.fromIndexTargets(cfs.metadata,
+                                           Collections.singletonList(new IndexTarget(cd.name, IndexTarget.Type.VALUES)),
+                                           "test_index",
+                                           IndexMetadata.Kind.CUSTOM,
+                                           ImmutableMap.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME,
+                                                           StubIndex.class.getName()));
 
         if (!cfs.metadata.getIndexes().get("test_index").isPresent())
             cfs.metadata.indexes(cfs.metadata.getIndexes().with(indexDef));
@@ -480,7 +493,7 @@ public class RangeTombstoneTest
 
         StubIndex index = (StubIndex)cfs.indexManager.listIndexes()
                                                      .stream()
-                                                     .filter(i -> "test_index".equals(i.getIndexName()))
+                                                     .filter(i -> "test_index".equals(i.getIndexMetadata().name))
                                                      .findFirst()
                                                      .orElseThrow(() -> new RuntimeException(new AssertionError("Index not found")));
         index.reset();
@@ -560,11 +573,13 @@ public class RangeTombstoneTest
         cfs.disableAutoCompaction();
 
         ColumnDefinition cd = cfs.metadata.getColumnDefinition(indexedColumnName).copy();
-        IndexMetadata indexDef = IndexMetadata.singleColumnIndex(cd,
-                                                                 "test_index",
-                                                                 IndexMetadata.IndexType.CUSTOM,
-                                                                 ImmutableMap.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME,
-                                                                                 StubIndex.class.getName()));
+        IndexMetadata indexDef =
+            IndexMetadata.fromIndexTargets(cfs.metadata,
+                                           Collections.singletonList(new IndexTarget(cd.name, IndexTarget.Type.VALUES)),
+                                           "test_index",
+                                           IndexMetadata.Kind.CUSTOM,
+                                           ImmutableMap.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME,
+                                                           StubIndex.class.getName()));
 
         if (!cfs.metadata.getIndexes().get("test_index").isPresent())
             cfs.metadata.indexes(cfs.metadata.getIndexes().with(indexDef));
@@ -574,11 +589,7 @@ public class RangeTombstoneTest
         if (rebuild != null)
             rebuild.get();
 
-        StubIndex index = (StubIndex)cfs.indexManager.listIndexes()
-                                                     .stream()
-                                                     .filter(i -> "test_index".equals(i.getIndexName()))
-                                                     .findFirst()
-                                                     .orElseThrow(() -> new RuntimeException(new AssertionError("Index not found")));
+        StubIndex index = (StubIndex)cfs.indexManager.getIndexByName("test_index");
         index.reset();
 
         UpdateBuilder.create(cfs.metadata, key).withTimestamp(0).newRow(1).add("val", 1).applyUnsafe();

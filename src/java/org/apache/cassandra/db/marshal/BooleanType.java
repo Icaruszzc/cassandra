@@ -25,6 +25,7 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.BooleanSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,14 +36,14 @@ public class BooleanType extends AbstractType<Boolean>
 
     public static final BooleanType instance = new BooleanType();
 
-    BooleanType() {} // singleton
+    BooleanType() {super(ComparisonType.CUSTOM);} // singleton
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         if (!o1.hasRemaining() || !o2.hasRemaining())
             return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
@@ -80,7 +81,7 @@ public class BooleanType extends AbstractType<Boolean>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return getSerializer().deserialize(buffer).toString();
     }

@@ -17,18 +17,16 @@
  */
 package org.apache.cassandra.transport.messages;
 
-import java.nio.ByteBuffer;
-import java.util.List;
 import java.util.UUID;
 
 import com.google.common.collect.ImmutableMap;
 import io.netty.buffer.ByteBuf;
 
 import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.statements.ParsedStatement;
-import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.exceptions.PreparedQueryNotFoundException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
@@ -42,25 +40,16 @@ public class ExecuteMessage extends Message.Request
 {
     public static final Message.Codec<ExecuteMessage> codec = new Message.Codec<ExecuteMessage>()
     {
-        public ExecuteMessage decode(ByteBuf body, int version)
+        public ExecuteMessage decode(ByteBuf body, ProtocolVersion version)
         {
             byte[] id = CBUtil.readBytes(body);
-            if (version == 1)
-            {
-                List<ByteBuffer> values = CBUtil.readValueList(body, version);
-                ConsistencyLevel consistency = CBUtil.readConsistencyLevel(body);
-                return new ExecuteMessage(MD5Digest.wrap(id), QueryOptions.fromProtocolV1(consistency, values));
-            }
-            else
-            {
-                return new ExecuteMessage(MD5Digest.wrap(id), QueryOptions.codec.decode(body, version));
-            }
+            return new ExecuteMessage(MD5Digest.wrap(id), QueryOptions.codec.decode(body, version));
         }
 
-        public void encode(ExecuteMessage msg, ByteBuf dest, int version)
+        public void encode(ExecuteMessage msg, ByteBuf dest, ProtocolVersion version)
         {
             CBUtil.writeBytes(msg.statementId.bytes, dest);
-            if (version == 1)
+            if (version == ProtocolVersion.V1)
             {
                 CBUtil.writeValueList(msg.options.getValues(), dest);
                 CBUtil.writeConsistencyLevel(msg.options.getConsistency(), dest);
@@ -71,11 +60,11 @@ public class ExecuteMessage extends Message.Request
             }
         }
 
-        public int encodedSize(ExecuteMessage msg, int version)
+        public int encodedSize(ExecuteMessage msg, ProtocolVersion version)
         {
             int size = 0;
             size += CBUtil.sizeOfBytes(msg.statementId.bytes);
-            if (version == 1)
+            if (version == ProtocolVersion.V1)
             {
                 size += CBUtil.sizeOfValueList(msg.options.getValues());
                 size += CBUtil.sizeOfConsistencyLevel(msg.options.getConsistency());
@@ -98,7 +87,7 @@ public class ExecuteMessage extends Message.Request
         this.options = options;
     }
 
-    public Message.Response execute(QueryState state)
+    public Message.Response execute(QueryState state, long queryStartNanoTime)
     {
         try
         {
@@ -122,7 +111,7 @@ public class ExecuteMessage extends Message.Request
 
             if (state.traceNextQuery())
             {
-                state.createTracingSession();
+                state.createTracingSession(getCustomPayload());
 
                 ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
                 if (options.getPageSize() > 0)
@@ -131,12 +120,30 @@ public class ExecuteMessage extends Message.Request
                     builder.put("consistency_level", options.getConsistency().name());
                 if(options.getSerialConsistency() != null)
                     builder.put("serial_consistency_level", options.getSerialConsistency().name());
+                builder.put("query", prepared.rawCQLStatement);
 
-                // TODO we don't have [typed] access to CQL bind variables here.  CASSANDRA-4560 is open to add support.
+                for(int i=0;i<prepared.boundNames.size();i++)
+                {
+                    ColumnSpecification cs = prepared.boundNames.get(i);
+                    String boundName = cs.name.toString();
+                    String boundValue = cs.type.asCQL3Type().toCQLLiteral(options.getValues().get(i), options.getProtocolVersion());
+                    if ( boundValue.length() > 1000 )
+                    {
+                        boundValue = boundValue.substring(0, 1000) + "...'";
+                    }
+
+                    //Here we prefix boundName with the index to avoid possible collission in builder keys due to
+                    //having multiple boundValues for the same variable
+                    builder.put("bound_var_" + Integer.toString(i) + "_" + boundName, boundValue);
+                }
+
                 Tracing.instance.begin("Execute CQL3 prepared query", state.getClientAddress(), builder.build());
             }
 
-            Message.Response response = handler.processPrepared(statement, state, options, getCustomPayload());
+            // Some custom QueryHandlers are interested by the bound names. We provide them this information
+            // by wrapping the QueryOptions.
+            QueryOptions queryOptions = QueryOptions.addColumnSpecifications(options, prepared.boundNames);
+            Message.Response response = handler.processPrepared(statement, state, queryOptions, getCustomPayload(), queryStartNanoTime);
             if (options.skipMetadata() && response instanceof ResultMessage.Rows)
                 ((ResultMessage.Rows)response).result.metadata.setSkipMetadata();
 

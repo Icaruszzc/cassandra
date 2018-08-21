@@ -25,6 +25,7 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.Int32Serializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class Int32Type extends AbstractType<Integer>
@@ -33,6 +34,7 @@ public class Int32Type extends AbstractType<Integer>
 
     Int32Type()
     {
+        super(ComparisonType.CUSTOM);
     } // singleton
 
     public boolean isEmptyValueMeaningless()
@@ -40,7 +42,7 @@ public class Int32Type extends AbstractType<Integer>
         return true;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         if (!o1.hasRemaining() || !o2.hasRemaining())
             return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
@@ -94,7 +96,7 @@ public class Int32Type extends AbstractType<Integer>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return getSerializer().deserialize(buffer).toString();
     }

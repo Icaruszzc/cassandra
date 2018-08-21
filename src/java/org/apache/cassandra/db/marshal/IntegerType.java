@@ -26,6 +26,7 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.IntegerSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public final class IntegerType extends AbstractType<BigInteger>
@@ -58,14 +59,14 @@ public final class IntegerType extends AbstractType<BigInteger>
         return i;
     }
 
-    IntegerType() {/* singleton */}
+    IntegerType() {super(ComparisonType.CUSTOM);}/* singleton */
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public int compare(ByteBuffer lhs, ByteBuffer rhs)
+    public int compareCustom(ByteBuffer lhs, ByteBuffer rhs)
     {
         return IntegerType.compareIntegers(lhs, rhs);
     }
@@ -163,7 +164,7 @@ public final class IntegerType extends AbstractType<BigInteger>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return getSerializer().deserialize(buffer).toString();
     }

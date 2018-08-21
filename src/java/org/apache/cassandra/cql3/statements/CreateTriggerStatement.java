@@ -31,6 +31,7 @@ import org.apache.cassandra.schema.TriggerMetadata;
 import org.apache.cassandra.schema.Triggers;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.thrift.ThriftValidation;
 import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.triggers.TriggerExecutor;
@@ -59,7 +60,7 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
     public void validate(ClientState state) throws RequestValidationException
     {
         CFMetaData cfm = ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
-        if (cfm.isMaterializedView())
+        if (cfm.isView())
             throw new InvalidRequestException("Cannot CREATE TRIGGER against a materialized view");
 
         try
@@ -72,7 +73,7 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
         }
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws ConfigurationException, InvalidRequestException
+    public Event.SchemaChange announceMigration(QueryState queryState, boolean isLocalOnly) throws ConfigurationException, InvalidRequestException
     {
         CFMetaData cfm = Schema.instance.getCFMetaData(keyspace(), columnFamily()).copy();
         Triggers triggers = cfm.getTriggers();
@@ -80,19 +81,14 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
         if (triggers.get(triggerName).isPresent())
         {
             if (ifNotExists)
-                return false;
+                return null;
             else
                 throw new InvalidRequestException(String.format("Trigger %s already exists", triggerName));
         }
 
         cfm.triggers(triggers.with(TriggerMetadata.create(triggerName, triggerClass)));
         logger.info("Adding trigger with name {} and class {}", triggerName, triggerClass);
-        MigrationManager.announceColumnFamilyUpdate(cfm, false, isLocalOnly);
-        return true;
-    }
-
-    public Event.SchemaChange changeEvent()
-    {
+        MigrationManager.announceColumnFamilyUpdate(cfm, isLocalOnly);
         return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }
 }

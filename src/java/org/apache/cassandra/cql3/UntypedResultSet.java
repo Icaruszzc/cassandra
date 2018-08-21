@@ -22,6 +22,7 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.AbstractIterator;
 
 import org.apache.cassandra.config.CFMetaData;
@@ -32,7 +33,6 @@ import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.service.pager.QueryPager;
-import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.FBUtilities;
 
 /** a utility for doing internal cql-based queries */
@@ -82,7 +82,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         {
             if (cqlRows.size() != 1)
                 throw new IllegalStateException("One row required, " + cqlRows.size() + " found");
-            return new Row(cqlRows.metadata.names, cqlRows.rows.get(0));
+            return new Row(cqlRows.metadata.requestNames(), cqlRows.rows.get(0));
         }
 
         public Iterator<Row> iterator()
@@ -95,7 +95,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                 {
                     if (!iter.hasNext())
                         return endOfData();
-                    return new Row(cqlRows.metadata.names, iter.next());
+                    return new Row(cqlRows.metadata.requestNames(), iter.next());
                 }
             };
         }
@@ -160,7 +160,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
             this.select = select;
             this.pager = pager;
             this.pageSize = pageSize;
-            this.metadata = select.getResultMetadata().names;
+            this.metadata = select.getResultMetadata().requestNames();
         }
 
         public int size()
@@ -187,7 +187,8 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                         if (pager.isExhausted())
                             return endOfData();
 
-                        try (ReadOrderGroup orderGroup = pager.startOrderGroup(); PartitionIterator iter = pager.fetchPageInternal(pageSize, orderGroup))
+                        try (ReadExecutionController executionController = pager.executionController();
+                             PartitionIterator iter = pager.fetchPageInternal(pageSize, executionController))
                         {
                             currentPage = select.process(iter, nowInSec).rows.iterator();
                         }
@@ -244,7 +245,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                 {
                     ComplexColumnData complexData = row.getComplexColumnData(def);
                     if (complexData != null)
-                        data.put(def.name.toString(), ((CollectionType)def.type).serializeForNativeProtocol(def, complexData.iterator(), Server.VERSION_3));
+                        data.put(def.name.toString(), ((CollectionType)def.type).serializeForNativeProtocol(complexData.iterator(), ProtocolVersion.V3));
                 }
             }
 

@@ -24,6 +24,8 @@ import javax.net.ssl.SSLContext;
 
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
+import com.datastax.driver.core.policies.LoadBalancingPolicy;
+import com.datastax.driver.core.policies.TokenAwarePolicy;
 import com.datastax.driver.core.policies.WhiteListPolicy;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.util.internal.logging.Slf4JLoggerFactory;
@@ -44,11 +46,14 @@ public class JavaDriverClient
     public final String username;
     public final String password;
     public final AuthProvider authProvider;
+    public final int maxPendingPerConnection;
+    public final int connectionsPerHost;
 
+    private final ProtocolVersion protocolVersion;
     private final EncryptionOptions.ClientEncryptionOptions encryptionOptions;
     private Cluster cluster;
     private Session session;
-    private final WhiteListPolicy whitelist;
+    private final LoadBalancingPolicy loadBalancingPolicy;
 
     private static final ConcurrentMap<String, PreparedStatement> stmts = new ConcurrentHashMap<>();
 
@@ -59,16 +64,43 @@ public class JavaDriverClient
 
     public JavaDriverClient(StressSettings settings, String host, int port, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
     {
+        this.protocolVersion = settings.mode.protocolVersion;
         this.host = host;
         this.port = port;
         this.username = settings.mode.username;
         this.password = settings.mode.password;
         this.authProvider = settings.mode.authProvider;
         this.encryptionOptions = encryptionOptions;
-        if (settings.node.isWhiteList)
-            whitelist = new WhiteListPolicy(new DCAwareRoundRobinPolicy(), settings.node.resolveAll(settings.port.nativePort));
+        this.loadBalancingPolicy = loadBalancingPolicy(settings);
+        this.connectionsPerHost = settings.mode.connectionsPerHost == null ? 8 : settings.mode.connectionsPerHost;
+
+        int maxThreadCount = 0;
+        if (settings.rate.auto)
+            maxThreadCount = settings.rate.maxThreads;
         else
-            whitelist = null;
+            maxThreadCount = settings.rate.threadCount;
+
+        //Always allow enough pending requests so every thread can have a request pending
+        //See https://issues.apache.org/jira/browse/CASSANDRA-7217
+        int requestsPerConnection = (maxThreadCount / connectionsPerHost) + connectionsPerHost;
+
+        maxPendingPerConnection = settings.mode.maxPendingPerConnection == null ? Math.max(128, requestsPerConnection ) : settings.mode.maxPendingPerConnection;
+    }
+
+    private LoadBalancingPolicy loadBalancingPolicy(StressSettings settings)
+    {
+        DCAwareRoundRobinPolicy.Builder policyBuilder = DCAwareRoundRobinPolicy.builder();
+        if (settings.node.datacenter != null)
+            policyBuilder.withLocalDc(settings.node.datacenter);
+
+        LoadBalancingPolicy ret = null;
+        if (settings.node.datacenter != null)
+            ret = policyBuilder.build();
+
+        if (settings.node.isWhiteList)
+            ret = new WhiteListPolicy(ret == null ? policyBuilder.build() : ret, settings.node.resolveAll(settings.port.nativePort));
+
+        return new TokenAwarePolicy(ret == null ? policyBuilder.build() : ret);
     }
 
     public PreparedStatement prepare(String query)
@@ -89,22 +121,29 @@ public class JavaDriverClient
 
     public void connect(ProtocolOptions.Compression compression) throws Exception
     {
-        PoolingOptions poolingOpts = new PoolingOptions();
-        poolingOpts.setCoreConnectionsPerHost(HostDistance.LOCAL, 8);
+
+        PoolingOptions poolingOpts = new PoolingOptions()
+                                     .setConnectionsPerHost(HostDistance.LOCAL, connectionsPerHost, connectionsPerHost)
+                                     .setMaxRequestsPerConnection(HostDistance.LOCAL, maxPendingPerConnection)
+                                     .setNewConnectionThreshold(HostDistance.LOCAL, 100);
+
         Cluster.Builder clusterBuilder = Cluster.builder()
                                                 .addContactPoint(host)
                                                 .withPort(port)
                                                 .withPoolingOptions(poolingOpts)
-                                                .withProtocolVersion(ProtocolVersion.V2)
+                                                .withoutJMXReporting()
+                                                .withProtocolVersion(protocolVersion)
                                                 .withoutMetrics(); // The driver uses metrics 3 with conflict with our version
-        if (whitelist != null)
-            clusterBuilder.withLoadBalancingPolicy(whitelist);
+        if (loadBalancingPolicy != null)
+            clusterBuilder.withLoadBalancingPolicy(loadBalancingPolicy);
         clusterBuilder.withCompression(compression);
         if (encryptionOptions.enabled)
         {
             SSLContext sslContext;
             sslContext = SSLFactory.createSSLContext(encryptionOptions, true);
-            SSLOptions sslOptions = new SSLOptions(sslContext, encryptionOptions.cipher_suites);
+            SSLOptions sslOptions = JdkSSLOptions.builder()
+                                                 .withSSLContext(sslContext)
+                                                 .withCipherSuites(encryptionOptions.cipher_suites).build();
             clusterBuilder.withSSL(sslOptions);
         }
 
@@ -119,8 +158,11 @@ public class JavaDriverClient
 
         cluster = clusterBuilder.build();
         Metadata metadata = cluster.getMetadata();
-        System.out.printf("Connected to cluster: %s%n",
-                metadata.getClusterName());
+        System.out.printf(
+                "Connected to cluster: %s, max pending requests per connection %d, max connections per host %d%n",
+                metadata.getClusterName(),
+                maxPendingPerConnection,
+                connectionsPerHost);
         for (Host host : metadata.getAllHosts())
         {
             System.out.printf("Datatacenter: %s; Host: %s; Rack: %s%n",
@@ -142,14 +184,13 @@ public class JavaDriverClient
 
     public ResultSet execute(String query, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
-        SimpleStatement stmt = getSession().newSimpleStatement(query);
+        SimpleStatement stmt = new SimpleStatement(query);
         stmt.setConsistencyLevel(from(consistency));
         return getSession().execute(stmt);
     }
 
     public ResultSet executePrepared(PreparedStatement stmt, List<Object> queryParams, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
-
         stmt.setConsistencyLevel(from(consistency));
         BoundStatement bstmt = stmt.bind((Object[]) queryParams.toArray(new Object[queryParams.size()]));
         return getSession().execute(bstmt);

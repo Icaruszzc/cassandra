@@ -18,6 +18,7 @@
 package org.apache.cassandra.streaming.messages;
 
 import java.io.IOException;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
 
@@ -37,6 +38,8 @@ public abstract class StreamMessage
     public static final int VERSION_30 = 4;
     public static final int CURRENT_VERSION = VERSION_30;
 
+    private transient volatile boolean sent = false;
+
     public static void serialize(StreamMessage message, DataOutputStreamPlus out, int version, StreamSession session) throws IOException
     {
         ByteBuffer buff = ByteBuffer.allocate(1);
@@ -50,18 +53,33 @@ public abstract class StreamMessage
     public static StreamMessage deserialize(ReadableByteChannel in, int version, StreamSession session) throws IOException
     {
         ByteBuffer buff = ByteBuffer.allocate(1);
-        if (in.read(buff) > 0)
+        int readBytes = in.read(buff);
+        if (readBytes > 0)
         {
             buff.flip();
             Type type = Type.get(buff.get());
             return type.inSerializer.deserialize(in, version, session);
         }
-        else
+        else if (readBytes == 0)
         {
-            // when socket gets closed, there is a chance that buff is empty
-            // in that case, just return null
+            // input socket buffer was not filled yet
             return null;
         }
+        else
+        {
+            // possibly socket gets closed
+            throw new SocketException("End-of-stream reached");
+        }
+    }
+
+    public void sent()
+    {
+        sent = true;
+    }
+
+    public boolean wasSent()
+    {
+        return sent;
     }
 
     /** StreamMessage serializer */
@@ -79,7 +97,8 @@ public abstract class StreamMessage
         RECEIVED(3, 4, ReceivedMessage.serializer),
         RETRY(4, 4, RetryMessage.serializer),
         COMPLETE(5, 1, CompleteMessage.serializer),
-        SESSION_FAILED(6, 5, SessionFailedMessage.serializer);
+        SESSION_FAILED(6, 5, SessionFailedMessage.serializer),
+        KEEP_ALIVE(7, 5, KeepAliveMessage.serializer);
 
         public static Type get(byte type)
         {

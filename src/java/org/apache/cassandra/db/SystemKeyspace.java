@@ -23,27 +23,35 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import javax.management.openmbean.OpenDataException;
 import javax.management.openmbean.TabularData;
+import java.util.concurrent.Future;
 
 import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.SetMultimap;
+import com.google.common.collect.Sets;
 import com.google.common.io.ByteStreams;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.util.concurrent.Futures;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.functions.*;
-import org.apache.cassandra.db.commitlog.ReplayPosition;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.compaction.CompactionHistoryTabularData;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -57,13 +65,14 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.paxos.Commit;
 import org.apache.cassandra.service.paxos.PaxosState;
 import org.apache.cassandra.thrift.cassandraConstants;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.*;
 
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonMap;
 import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
+import static org.apache.cassandra.io.util.FileUtils.visitDirectory;
 
 public final class SystemKeyspace
 {
@@ -82,8 +91,6 @@ public final class SystemKeyspace
     // Cassandra was not previously installed and we're in the process of starting a fresh node.
     public static final CassandraVersion NULL_VERSION = new CassandraVersion("0.0.0-absent");
 
-    public static final String NAME = "system";
-
     public static final String BATCHES = "batches";
     public static final String PAXOS = "paxos";
     public static final String BUILT_INDEXES = "IndexInfo";
@@ -95,8 +102,10 @@ public final class SystemKeyspace
     public static final String SSTABLE_ACTIVITY = "sstable_activity";
     public static final String SIZE_ESTIMATES = "size_estimates";
     public static final String AVAILABLE_RANGES = "available_ranges";
-    public static final String MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS = "materialized_views_builds_in_progress";
-    public static final String BUILT_MATERIALIZED_VIEWS = "built_materialized_views";
+    public static final String TRANSFERRED_RANGES = "transferred_ranges";
+    public static final String VIEWS_BUILDS_IN_PROGRESS = "views_builds_in_progress";
+    public static final String BUILT_VIEWS = "built_views";
+    public static final String PREPARED_STATEMENTS = "prepared_statements";
 
     @Deprecated public static final String LEGACY_HINTS = "hints";
     @Deprecated public static final String LEGACY_BATCHLOG = "batchlog";
@@ -113,7 +122,7 @@ public final class SystemKeyspace
                 "batches awaiting replay",
                 "CREATE TABLE %s ("
                 + "id timeuuid,"
-                + "data blob,"
+                + "mutations list<blob>,"
                 + "version int,"
                 + "PRIMARY KEY ((id)))")
                 .copy(new LocalPartitioner(TimeUUIDType.instance))
@@ -246,9 +255,19 @@ public final class SystemKeyspace
                 + "ranges set<blob>,"
                 + "PRIMARY KEY ((keyspace_name)))");
 
-    private static final CFMetaData MaterializedViewsBuildsInProgress =
-        compile(MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS,
-                "materialized views builds current progress",
+    private static final CFMetaData TransferredRanges =
+        compile(TRANSFERRED_RANGES,
+                "record of transferred ranges for streaming operation",
+                "CREATE TABLE %s ("
+                + "operation text,"
+                + "peer inet,"
+                + "keyspace_name text,"
+                + "ranges set<blob>,"
+                + "PRIMARY KEY ((operation, keyspace_name), peer))");
+
+    private static final CFMetaData ViewsBuildsInProgress =
+        compile(VIEWS_BUILDS_IN_PROGRESS,
+                "views builds current progress",
                 "CREATE TABLE %s ("
                 + "keyspace_name text,"
                 + "view_name text,"
@@ -256,13 +275,23 @@ public final class SystemKeyspace
                 + "generation_number int,"
                 + "PRIMARY KEY ((keyspace_name), view_name))");
 
-    private static final CFMetaData BuiltMaterializedViews =
-        compile(BUILT_MATERIALIZED_VIEWS,
-                "built materialized views",
+    private static final CFMetaData BuiltViews =
+        compile(BUILT_VIEWS,
+                "built views",
                 "CREATE TABLE %s ("
                 + "keyspace_name text,"
                 + "view_name text,"
+                + "status_replicated boolean,"
                 + "PRIMARY KEY ((keyspace_name), view_name))");
+
+    private static final CFMetaData PreparedStatements =
+        compile(PREPARED_STATEMENTS,
+                "prepared statements",
+                "CREATE TABLE %s ("
+                + "prepared_id blob,"
+                + "logged_keyspace text,"
+                + "query_string text,"
+                + "PRIMARY KEY ((prepared_id)))");
 
     @Deprecated
     public static final CFMetaData LegacyHints =
@@ -408,13 +437,13 @@ public final class SystemKeyspace
 
     private static CFMetaData compile(String name, String description, String schema)
     {
-        return CFMetaData.compile(String.format(schema, name), NAME)
+        return CFMetaData.compile(String.format(schema, name), SchemaConstants.SYSTEM_KEYSPACE_NAME)
                          .comment(description);
     }
 
     public static KeyspaceMetadata metadata()
     {
-        return KeyspaceMetadata.create(NAME, KeyspaceParams.local(), tables(), Types.none(), functions());
+        return KeyspaceMetadata.create(SchemaConstants.SYSTEM_KEYSPACE_NAME, KeyspaceParams.local(), tables(), Views.none(), Types.none(), functions());
     }
 
     private static Tables tables()
@@ -430,10 +459,12 @@ public final class SystemKeyspace
                          SSTableActivity,
                          SizeEstimates,
                          AvailableRanges,
-                         MaterializedViewsBuildsInProgress,
-                         BuiltMaterializedViews,
+                         TransferredRanges,
+                         ViewsBuildsInProgress,
+                         BuiltViews,
                          LegacyHints,
                          LegacyBatchlog,
+                         PreparedStatements,
                          LegacyKeyspaces,
                          LegacyColumnfamilies,
                          LegacyColumns,
@@ -450,10 +481,11 @@ public final class SystemKeyspace
                         .add(TimeFcts.all())
                         .add(BytesConversionFcts.all())
                         .add(AggregateFcts.all())
+                        .add(CastFcts.all())
                         .build();
     }
 
-    private static volatile Map<UUID, Pair<ReplayPosition, Long>> truncationRecords;
+    private static volatile Map<UUID, Pair<CommitLogPosition, Long>> truncationRecords;
 
     public enum BootstrapState
     {
@@ -465,11 +497,10 @@ public final class SystemKeyspace
 
     public static void finishStartup()
     {
-        persistLocalMetadata();
         SchemaKeyspace.saveSystemKeyspacesSchema();
     }
 
-    private static void persistLocalMetadata()
+    public static void persistLocalMetadata()
     {
         String req = "INSERT INTO system.%s (" +
                      "key," +
@@ -492,7 +523,7 @@ public final class SystemKeyspace
                             FBUtilities.getReleaseVersionString(),
                             QueryProcessor.CQL_VERSION.toString(),
                             cassandraConstants.VERSION,
-                            String.valueOf(Server.CURRENT_VERSION),
+                            String.valueOf(ProtocolVersion.CURRENT.asInt()),
                             snitch.getDatacenter(FBUtilities.getBroadcastAddress()),
                             snitch.getRack(FBUtilities.getBroadcastAddress()),
                             DatabaseDescriptor.getPartitioner().getClass().getName(),
@@ -531,61 +562,75 @@ public final class SystemKeyspace
     public static boolean isViewBuilt(String keyspaceName, String viewName)
     {
         String req = "SELECT view_name FROM %s.\"%s\" WHERE keyspace_name=? AND view_name=?";
-        UntypedResultSet result = executeInternal(String.format(req, NAME, BUILT_MATERIALIZED_VIEWS), keyspaceName, viewName);
+        UntypedResultSet result = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName);
         return !result.isEmpty();
     }
 
-    public static void setMaterializedViewBuilt(String keyspaceName, String viewName)
+    public static boolean isViewStatusReplicated(String keyspaceName, String viewName)
     {
-        String req = "INSERT INTO %s.\"%s\" (keyspace_name, view_name) VALUES (?, ?)";
-        executeInternal(String.format(req, NAME, BUILT_MATERIALIZED_VIEWS), keyspaceName, viewName);
-        forceBlockingFlush(BUILT_MATERIALIZED_VIEWS);
+        String req = "SELECT status_replicated FROM %s.\"%s\" WHERE keyspace_name=? AND view_name=?";
+        UntypedResultSet result = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName);
+
+        if (result.isEmpty())
+            return false;
+        UntypedResultSet.Row row = result.one();
+        return row.has("status_replicated") && row.getBoolean("status_replicated");
     }
 
+    public static void setViewBuilt(String keyspaceName, String viewName, boolean replicated)
+    {
+        String req = "INSERT INTO %s.\"%s\" (keyspace_name, view_name, status_replicated) VALUES (?, ?, ?)";
+        executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName, replicated);
+        forceBlockingFlush(BUILT_VIEWS);
+    }
 
-    public static void setMaterializedViewRemoved(String keyspaceName, String viewName)
+    public static void setViewRemoved(String keyspaceName, String viewName)
     {
         String buildReq = "DELETE FROM %S.%s WHERE keyspace_name = ? AND view_name = ?";
-        executeInternal(String.format(buildReq, NAME, MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS), keyspaceName, viewName);
-        forceBlockingFlush(MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS);
+        executeInternal(String.format(buildReq, SchemaConstants.SYSTEM_KEYSPACE_NAME, VIEWS_BUILDS_IN_PROGRESS), keyspaceName, viewName);
+        forceBlockingFlush(VIEWS_BUILDS_IN_PROGRESS);
 
         String builtReq = "DELETE FROM %s.\"%s\" WHERE keyspace_name = ? AND view_name = ?";
-        executeInternal(String.format(builtReq, NAME, BUILT_MATERIALIZED_VIEWS), keyspaceName, viewName);
-        forceBlockingFlush(BUILT_MATERIALIZED_VIEWS);
+        executeInternal(String.format(builtReq, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName);
+        forceBlockingFlush(BUILT_VIEWS);
     }
 
-    public static void beginMaterializedViewBuild(String ksname, String viewName, int generationNumber)
+    public static void beginViewBuild(String ksname, String viewName, int generationNumber)
     {
-        executeInternal(String.format("INSERT INTO system.%s (keyspace_name, view_name, generation_number) VALUES (?, ?, ?)", MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS),
+        executeInternal(String.format("INSERT INTO system.%s (keyspace_name, view_name, generation_number) VALUES (?, ?, ?)", VIEWS_BUILDS_IN_PROGRESS),
                         ksname,
                         viewName,
                         generationNumber);
     }
 
-    public static void finishMaterializedViewBuildStatus(String ksname, String viewName)
+    public static void finishViewBuildStatus(String ksname, String viewName)
     {
         // We flush the view built first, because if we fail now, we'll restart at the last place we checkpointed
-        // materialized view build.
+        // view build.
         // If we flush the delete first, we'll have to restart from the beginning.
-        // Also, if the build succeeded, but the materialized view build failed, we will be able to skip the
-        // materialized view build check next boot.
-        setMaterializedViewBuilt(ksname, viewName);
-        forceBlockingFlush(BUILT_MATERIALIZED_VIEWS);
-        executeInternal(String.format("DELETE FROM system.%s WHERE keyspace_name = ? AND view_name = ?", MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS), ksname, viewName);
-        forceBlockingFlush(MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS);
+        // Also, if writing to the built_view succeeds, but the view_builds_in_progress deletion fails, we will be able
+        // to skip the view build next boot.
+        setViewBuilt(ksname, viewName, false);
+        executeInternal(String.format("DELETE FROM system.%s WHERE keyspace_name = ? AND view_name = ?", VIEWS_BUILDS_IN_PROGRESS), ksname, viewName);
+        forceBlockingFlush(VIEWS_BUILDS_IN_PROGRESS);
     }
 
-    public static void updateMaterializedViewBuildStatus(String ksname, String viewName, Token token)
+    public static void setViewBuiltReplicated(String ksname, String viewName)
+    {
+        setViewBuilt(ksname, viewName, true);
+    }
+
+    public static void updateViewBuildStatus(String ksname, String viewName, Token token)
     {
         String req = "INSERT INTO system.%s (keyspace_name, view_name, last_token) VALUES (?, ?, ?)";
-        Token.TokenFactory factory = MaterializedViewsBuildsInProgress.partitioner.getTokenFactory();
-        executeInternal(String.format(req, MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS), ksname, viewName, factory.toString(token));
+        Token.TokenFactory factory = ViewsBuildsInProgress.partitioner.getTokenFactory();
+        executeInternal(String.format(req, VIEWS_BUILDS_IN_PROGRESS), ksname, viewName, factory.toString(token));
     }
 
-    public static Pair<Integer, Token> getMaterializedViewBuildStatus(String ksname, String viewName)
+    public static Pair<Integer, Token> getViewBuildStatus(String ksname, String viewName)
     {
         String req = "SELECT generation_number, last_token FROM system.%s WHERE keyspace_name = ? AND view_name = ?";
-        UntypedResultSet queryResultSet = executeInternal(String.format(req, MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS), ksname, viewName);
+        UntypedResultSet queryResultSet = executeInternal(String.format(req, VIEWS_BUILDS_IN_PROGRESS), ksname, viewName);
         if (queryResultSet == null || queryResultSet.isEmpty())
             return null;
 
@@ -597,14 +642,14 @@ public final class SystemKeyspace
             generation = row.getInt("generation_number");
         if (row.has("last_key"))
         {
-            Token.TokenFactory factory = MaterializedViewsBuildsInProgress.partitioner.getTokenFactory();
+            Token.TokenFactory factory = ViewsBuildsInProgress.partitioner.getTokenFactory();
             lastKey = factory.fromString(row.getString("last_key"));
         }
 
         return Pair.create(generation, lastKey);
     }
 
-    public static synchronized void saveTruncationRecord(ColumnFamilyStore cfs, long truncatedAt, ReplayPosition position)
+    public static synchronized void saveTruncationRecord(ColumnFamilyStore cfs, long truncatedAt, CommitLogPosition position)
     {
         String req = "UPDATE system.%s SET truncated_at = truncated_at + ? WHERE key = '%s'";
         executeInternal(String.format(req, LOCAL, LOCAL), truncationAsMapEntry(cfs, truncatedAt, position));
@@ -623,13 +668,13 @@ public final class SystemKeyspace
         forceBlockingFlush(LOCAL);
     }
 
-    private static Map<UUID, ByteBuffer> truncationAsMapEntry(ColumnFamilyStore cfs, long truncatedAt, ReplayPosition position)
+    private static Map<UUID, ByteBuffer> truncationAsMapEntry(ColumnFamilyStore cfs, long truncatedAt, CommitLogPosition position)
     {
-        try (DataOutputBuffer out = new DataOutputBuffer())
+        try (DataOutputBuffer out = DataOutputBuffer.scratchBuffer.get())
         {
-            ReplayPosition.serializer.serialize(position, out);
+            CommitLogPosition.serializer.serialize(position, out);
             out.writeLong(truncatedAt);
-            return singletonMap(cfs.metadata.cfId, ByteBuffer.wrap(out.getData(), 0, out.getLength()));
+            return singletonMap(cfs.metadata.cfId, out.asNewBuffer());
         }
         catch (IOException e)
         {
@@ -637,30 +682,30 @@ public final class SystemKeyspace
         }
     }
 
-    public static ReplayPosition getTruncatedPosition(UUID cfId)
+    public static CommitLogPosition getTruncatedPosition(UUID cfId)
     {
-        Pair<ReplayPosition, Long> record = getTruncationRecord(cfId);
+        Pair<CommitLogPosition, Long> record = getTruncationRecord(cfId);
         return record == null ? null : record.left;
     }
 
     public static long getTruncatedAt(UUID cfId)
     {
-        Pair<ReplayPosition, Long> record = getTruncationRecord(cfId);
+        Pair<CommitLogPosition, Long> record = getTruncationRecord(cfId);
         return record == null ? Long.MIN_VALUE : record.right;
     }
 
-    private static synchronized Pair<ReplayPosition, Long> getTruncationRecord(UUID cfId)
+    private static synchronized Pair<CommitLogPosition, Long> getTruncationRecord(UUID cfId)
     {
         if (truncationRecords == null)
             truncationRecords = readTruncationRecords();
         return truncationRecords.get(cfId);
     }
 
-    private static Map<UUID, Pair<ReplayPosition, Long>> readTruncationRecords()
+    private static Map<UUID, Pair<CommitLogPosition, Long>> readTruncationRecords()
     {
         UntypedResultSet rows = executeInternal(String.format("SELECT truncated_at FROM system.%s WHERE key = '%s'", LOCAL, LOCAL));
 
-        Map<UUID, Pair<ReplayPosition, Long>> records = new HashMap<>();
+        Map<UUID, Pair<CommitLogPosition, Long>> records = new HashMap<>();
 
         if (!rows.isEmpty() && rows.one().has("truncated_at"))
         {
@@ -672,12 +717,11 @@ public final class SystemKeyspace
         return records;
     }
 
-    private static Pair<ReplayPosition, Long> truncationRecordFromBlob(ByteBuffer bytes)
+    private static Pair<CommitLogPosition, Long> truncationRecordFromBlob(ByteBuffer bytes)
     {
-        try
+        try (RebufferingInputStream in = new DataInputBuffer(bytes, true))
         {
-            NIODataInputStream in = new DataInputBuffer(bytes, true);
-            return Pair.create(ReplayPosition.serializer.deserialize(in), in.available() > 0 ? in.readLong() : Long.MIN_VALUE);
+            return Pair.create(CommitLogPosition.serializer.deserialize(in), in.available() > 0 ? in.readLong() : Long.MIN_VALUE);
         }
         catch (IOException e)
         {
@@ -688,32 +732,29 @@ public final class SystemKeyspace
     /**
      * Record tokens being used by another node
      */
-    public static synchronized void updateTokens(InetAddress ep, Collection<Token> tokens)
+    public static Future<?> updateTokens(final InetAddress ep, final Collection<Token> tokens, ExecutorService executorService)
     {
         if (ep.equals(FBUtilities.getBroadcastAddress()))
-        {
-            removeEndpoint(ep);
-            return;
-        }
+            return Futures.immediateFuture(null);
 
         String req = "INSERT INTO system.%s (peer, tokens) VALUES (?, ?)";
-        executeInternal(String.format(req, PEERS), ep, tokensAsSet(tokens));
+        return executorService.submit((Runnable) () -> executeInternal(String.format(req, PEERS), ep, tokensAsSet(tokens)));
     }
 
-    public static synchronized void updatePreferredIP(InetAddress ep, InetAddress preferred_ip)
+    public static void updatePreferredIP(InetAddress ep, InetAddress preferred_ip)
     {
         String req = "INSERT INTO system.%s (peer, preferred_ip) VALUES (?, ?)";
         executeInternal(String.format(req, PEERS), ep, preferred_ip);
         forceBlockingFlush(PEERS);
     }
 
-    public static synchronized void updatePeerInfo(InetAddress ep, String columnName, Object value)
+    public static Future<?> updatePeerInfo(final InetAddress ep, final String columnName, final Object value, ExecutorService executorService)
     {
         if (ep.equals(FBUtilities.getBroadcastAddress()))
-            return;
+            return Futures.immediateFuture(null);
 
         String req = "INSERT INTO system.%s (peer, %s) VALUES (?, ?)";
-        executeInternal(String.format(req, PEERS, columnName), ep, value);
+        return executorService.submit((Runnable) () -> executeInternal(String.format(req, PEERS, columnName), ep, value));
     }
 
     public static synchronized void updateHintsDropped(InetAddress ep, UUID timePeriod, int value)
@@ -752,10 +793,11 @@ public final class SystemKeyspace
     /**
      * Remove stored tokens being used by another node
      */
-    public static synchronized void removeEndpoint(InetAddress ep)
+    public static void removeEndpoint(InetAddress ep)
     {
         String req = "DELETE FROM system.%s WHERE peer = ?";
         executeInternal(String.format(req, PEERS), ep);
+        forceBlockingFlush(PEERS);
     }
 
     /**
@@ -769,26 +811,10 @@ public final class SystemKeyspace
         forceBlockingFlush(LOCAL);
     }
 
-    /**
-     * Convenience method to update the list of tokens in the local system keyspace.
-     *
-     * @param addTokens tokens to add
-     * @param rmTokens tokens to remove
-     * @return the collection of persisted tokens
-     */
-    public static synchronized Collection<Token> updateLocalTokens(Collection<Token> addTokens, Collection<Token> rmTokens)
-    {
-        Collection<Token> tokens = getSavedTokens();
-        tokens.removeAll(rmTokens);
-        tokens.addAll(addTokens);
-        updateTokens(tokens);
-        return tokens;
-    }
-
     public static void forceBlockingFlush(String cfname)
     {
-        if (!Boolean.getBoolean("cassandra.unsafesystem"))
-            FBUtilities.waitOnFuture(Keyspace.open(NAME).getColumnFamilyStore(cfname).forceFlush());
+        if (!DatabaseDescriptor.isUnsafeSystem())
+            FBUtilities.waitOnFuture(Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(cfname).forceFlush());
     }
 
     /**
@@ -904,7 +930,7 @@ public final class SystemKeyspace
         Keyspace keyspace;
         try
         {
-            keyspace = Keyspace.open(NAME);
+            keyspace = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);
         }
         catch (AssertionError err)
         {
@@ -1015,21 +1041,21 @@ public final class SystemKeyspace
     public static boolean isIndexBuilt(String keyspaceName, String indexName)
     {
         String req = "SELECT index_name FROM %s.\"%s\" WHERE table_name=? AND index_name=?";
-        UntypedResultSet result = executeInternal(String.format(req, NAME, BUILT_INDEXES), keyspaceName, indexName);
+        UntypedResultSet result = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, indexName);
         return !result.isEmpty();
     }
 
     public static void setIndexBuilt(String keyspaceName, String indexName)
     {
         String req = "INSERT INTO %s.\"%s\" (table_name, index_name) VALUES (?, ?)";
-        executeInternal(String.format(req, NAME, BUILT_INDEXES), keyspaceName, indexName);
+        executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, indexName);
         forceBlockingFlush(BUILT_INDEXES);
     }
 
     public static void setIndexRemoved(String keyspaceName, String indexName)
     {
         String req = "DELETE FROM %s.\"%s\" WHERE table_name = ? AND index_name = ?";
-        executeInternal(String.format(req, NAME, BUILT_INDEXES), keyspaceName, indexName);
+        executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, indexName);
         forceBlockingFlush(BUILT_INDEXES);
     }
 
@@ -1037,7 +1063,7 @@ public final class SystemKeyspace
     {
         List<String> names = new ArrayList<>(indexNames);
         String req = "SELECT index_name from %s.\"%s\" WHERE table_name=? AND index_name IN ?";
-        UntypedResultSet results = executeInternal(String.format(req, NAME, BUILT_INDEXES), keyspaceName, names);
+        UntypedResultSet results = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, names);
         return StreamSupport.stream(results.spliterator(), false)
                             .map(r -> r.getString("index_name"))
                             .collect(Collectors.toList());
@@ -1072,11 +1098,40 @@ public final class SystemKeyspace
         return hostId;
     }
 
+    /**
+     * Gets the stored rack for the local node, or null if none have been set yet.
+     */
+    public static String getRack()
+    {
+        String req = "SELECT rack FROM system.%s WHERE key='%s'";
+        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));
 
-    public static PaxosState loadPaxosState(DecoratedKey key, CFMetaData metadata)
+        // Look up the Rack (return it if found)
+        if (!result.isEmpty() && result.one().has("rack"))
+            return result.one().getString("rack");
+
+        return null;
+    }
+
+    /**
+     * Gets the stored data center for the local node, or null if none have been set yet.
+     */
+    public static String getDatacenter()
+    {
+        String req = "SELECT data_center FROM system.%s WHERE key='%s'";
+        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));
+
+        // Look up the Data center (return it if found)
+        if (!result.isEmpty() && result.one().has("data_center"))
+            return result.one().getString("data_center");
+
+        return null;
+    }
+
+    public static PaxosState loadPaxosState(DecoratedKey key, CFMetaData metadata, int nowInSec)
     {
         String req = "SELECT * FROM system.%s WHERE row_key = ? AND cf_id = ?";
-        UntypedResultSet results = executeInternal(String.format(req, PAXOS), key.getKey(), metadata.cfId);
+        UntypedResultSet results = QueryProcessor.executeInternalWithNow(nowInSec, System.nanoTime(), String.format(req, PAXOS), key.getKey(), metadata.cfId);
         if (results.isEmpty())
             return new PaxosState(key, metadata);
         UntypedResultSet.Row row = results.one();
@@ -1101,7 +1156,7 @@ public final class SystemKeyspace
         String req = "UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET in_progress_ballot = ? WHERE row_key = ? AND cf_id = ?";
         executeInternal(String.format(req, PAXOS),
                         UUIDGen.microsTimestamp(promise.ballot),
-                        paxosTtl(promise.update.metadata()),
+                        paxosTtlSec(promise.update.metadata()),
                         promise.ballot,
                         promise.update.partitionKey().getKey(),
                         promise.update.metadata().cfId);
@@ -1111,7 +1166,7 @@ public final class SystemKeyspace
     {
         executeInternal(String.format("UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET proposal_ballot = ?, proposal = ?, proposal_version = ? WHERE row_key = ? AND cf_id = ?", PAXOS),
                         UUIDGen.microsTimestamp(proposal.ballot),
-                        paxosTtl(proposal.update.metadata()),
+                        paxosTtlSec(proposal.update.metadata()),
                         proposal.ballot,
                         PartitionUpdate.toBytes(proposal.update, MessagingService.current_version),
                         MessagingService.current_version,
@@ -1119,7 +1174,7 @@ public final class SystemKeyspace
                         proposal.update.metadata().cfId);
     }
 
-    private static int paxosTtl(CFMetaData metadata)
+    public static int paxosTtlSec(CFMetaData metadata)
     {
         // keep paxos state around for at least 3h
         return Math.max(3 * 3600, metadata.params.gcGraceSeconds);
@@ -1132,7 +1187,7 @@ public final class SystemKeyspace
         String cql = "UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET proposal_ballot = null, proposal = null, most_recent_commit_at = ?, most_recent_commit = ?, most_recent_commit_version = ? WHERE row_key = ? AND cf_id = ?";
         executeInternal(String.format(cql, PAXOS),
                         UUIDGen.microsTimestamp(commit.ballot),
-                        paxosTtl(commit.update.metadata()),
+                        paxosTtlSec(commit.update.metadata()),
                         commit.ballot,
                         PartitionUpdate.toBytes(commit.update, MessagingService.current_version),
                         MessagingService.current_version,
@@ -1203,11 +1258,11 @@ public final class SystemKeyspace
         {
             Range<Token> range = entry.getKey();
             Pair<Long, Long> values = entry.getValue();
-            new RowUpdateBuilder(SizeEstimates, timestamp, mutation)
-                .clustering(table, range.left.toString(), range.right.toString())
-                .add("partitions_count", values.left)
-                .add("mean_partition_size", values.right)
-                .build();
+            update.add(Rows.simpleBuilder(SizeEstimates, table, range.left.toString(), range.right.toString())
+                           .timestamp(timestamp)
+                           .add("partitions_count", values.left)
+                           .add("mean_partition_size", values.right)
+                           .build());
         }
 
         mutation.apply();
@@ -1218,7 +1273,7 @@ public final class SystemKeyspace
      */
     public static void clearSizeEstimates(String keyspace, String table)
     {
-        String cql = String.format("DELETE FROM %s.%s WHERE keyspace_name = ? AND table_name = ?", NAME, SIZE_ESTIMATES);
+        String cql = String.format("DELETE FROM %s.%s WHERE keyspace_name = ? AND table_name = ?", SchemaConstants.SYSTEM_KEYSPACE_NAME, SIZE_ESTIMATES);
         executeInternal(cql, keyspace, table);
     }
 
@@ -1251,8 +1306,41 @@ public final class SystemKeyspace
 
     public static void resetAvailableRanges()
     {
-        ColumnFamilyStore availableRanges = Keyspace.open(NAME).getColumnFamilyStore(AVAILABLE_RANGES);
+        ColumnFamilyStore availableRanges = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(AVAILABLE_RANGES);
         availableRanges.truncateBlocking();
+    }
+
+    public static synchronized void updateTransferredRanges(String description,
+                                                         InetAddress peer,
+                                                         String keyspace,
+                                                         Collection<Range<Token>> streamedRanges)
+    {
+        String cql = "UPDATE system.%s SET ranges = ranges + ? WHERE operation = ? AND peer = ? AND keyspace_name = ?";
+        Set<ByteBuffer> rangesToUpdate = new HashSet<>(streamedRanges.size());
+        for (Range<Token> range : streamedRanges)
+        {
+            rangesToUpdate.add(rangeToBytes(range));
+        }
+        executeInternal(String.format(cql, TRANSFERRED_RANGES), rangesToUpdate, description, peer, keyspace);
+    }
+
+    public static synchronized Map<InetAddress, Set<Range<Token>>> getTransferredRanges(String description, String keyspace, IPartitioner partitioner)
+    {
+        Map<InetAddress, Set<Range<Token>>> result = new HashMap<>();
+        String query = "SELECT * FROM system.%s WHERE operation = ? AND keyspace_name = ?";
+        UntypedResultSet rs = executeInternal(String.format(query, TRANSFERRED_RANGES), description, keyspace);
+        for (UntypedResultSet.Row row : rs)
+        {
+            InetAddress peer = row.getInetAddress("peer");
+            Set<ByteBuffer> rawRanges = row.getSet("ranges", BytesType.instance);
+            Set<Range<Token>> ranges = Sets.newHashSetWithExpectedSize(rawRanges.size());
+            for (ByteBuffer rawRange : rawRanges)
+            {
+                ranges.add(byteBufferToRange(rawRange, partitioner));
+            }
+            result.put(peer, ranges);
+        }
+        return ImmutableMap.copyOf(result);
     }
 
     /**
@@ -1275,7 +1363,7 @@ public final class SystemKeyspace
             String snapshotName = Keyspace.getTimestampedSnapshotName(String.format("upgrade-%s-%s",
                                                                                     previous,
                                                                                     next));
-            Keyspace systemKs = Keyspace.open(SystemKeyspace.NAME);
+            Keyspace systemKs = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);
             systemKs.snapshot(snapshotName, null);
             return true;
         }
@@ -1304,11 +1392,11 @@ public final class SystemKeyspace
             // the current version is. If we couldn't read a previous version from system.local we check for
             // the existence of the legacy system.Versions table. We don't actually attempt to read a version
             // from there, but it informs us that this isn't a completely new node.
-            for (File dataDirectory : Directories.getKSChildDirectories(SystemKeyspace.NAME))
+            for (File dataDirectory : Directories.getKSChildDirectories(SchemaConstants.SYSTEM_KEYSPACE_NAME))
             {
                 if (dataDirectory.getName().equals("Versions") && dataDirectory.listFiles().length > 0)
                 {
-                    logger.debug("Found unreadable versions info in pre 1.2 system.Versions table");
+                    logger.trace("Found unreadable versions info in pre 1.2 system.Versions table");
                     return UNREADABLE_VERSION.toString();
                 }
             }
@@ -1329,24 +1417,33 @@ public final class SystemKeyspace
         Iterable<String> dirs = Arrays.asList(DatabaseDescriptor.getAllDataFileLocations());
         for (String dataDir : dirs)
         {
-            logger.debug("Checking directory {} for old files", dataDir);
+            logger.debug("Checking {} for legacy files", dataDir);
             File dir = new File(dataDir);
             assert dir.exists() : dir + " should have been created by startup checks";
 
-            for (File ksdir : dir.listFiles((d, n) -> d.isDirectory()))
-            {
-                for (File cfdir : ksdir.listFiles((d, n) -> d.isDirectory()))
-                {
-                    if (Descriptor.isLegacyFile(cfdir))
-                    {
-                        FileUtils.deleteRecursive(cfdir);
-                    }
-                    else
-                    {
-                        FileUtils.delete(cfdir.listFiles((d, n) -> Descriptor.isLegacyFile(new File(d, n))));
-                    }
-                }
-            }
+            visitDirectory(dir.toPath(),
+                           File::isDirectory,
+                           ksdir ->
+                           {
+                               logger.trace("Checking {} for legacy files", ksdir);
+                               visitDirectory(ksdir.toPath(),
+                                              File::isDirectory,
+                                              cfdir ->
+                                              {
+                                                  logger.trace("Checking {} for legacy files", cfdir);
+
+                                                  if (Descriptor.isLegacyFile(cfdir))
+                                                  {
+                                                      FileUtils.deleteRecursive(cfdir);
+                                                  }
+                                                  else
+                                                  {
+                                                      visitDirectory(cfdir.toPath(),
+                                                                     Descriptor::isLegacyFile,
+                                                                     FileUtils::delete);
+                                                  }
+                                              });
+                           });
         }
     }
 
@@ -1378,4 +1475,37 @@ public final class SystemKeyspace
         }
     }
 
+    public static void writePreparedStatement(String loggedKeyspace, MD5Digest key, String cql)
+    {
+        executeInternal(String.format("INSERT INTO %s.%s"
+                                      + " (logged_keyspace, prepared_id, query_string) VALUES (?, ?, ?)",
+                                      SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS),
+                        loggedKeyspace, key.byteBuffer(), cql);
+        logger.debug("stored prepared statement for logged keyspace '{}': '{}'", loggedKeyspace, cql);
+    }
+
+    public static void removePreparedStatement(MD5Digest key)
+    {
+        executeInternal(String.format("DELETE FROM %s.%s"
+                                      + " WHERE prepared_id = ?",
+                                      SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS),
+                        key.byteBuffer());
+    }
+
+    public static void resetPreparedStatements()
+    {
+        ColumnFamilyStore availableRanges = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(PREPARED_STATEMENTS);
+        availableRanges.truncateBlocking();
+    }
+
+    public static List<Pair<String, String>> loadPreparedStatements()
+    {
+        String query = String.format("SELECT logged_keyspace, query_string FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS);
+        UntypedResultSet resultSet = executeOnceInternal(query);
+        List<Pair<String, String>> r = new ArrayList<>();
+        for (UntypedResultSet.Row row : resultSet)
+            r.add(Pair.create(row.has("logged_keyspace") ? row.getString("logged_keyspace") : null,
+                              row.getString("query_string")));
+        return r;
+    }
 }

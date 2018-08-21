@@ -29,6 +29,7 @@ import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.BytesSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /*
@@ -61,10 +62,11 @@ public class ColumnToCollectionType extends AbstractType<ByteBuffer>
 
     private ColumnToCollectionType(Map<ByteBuffer, CollectionType> defined)
     {
+        super(ComparisonType.CUSTOM);
         this.defined = ImmutableMap.copyOf(defined);
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         throw new UnsupportedOperationException("ColumnToCollectionType should only be used in composite types, never alone");
     }
@@ -102,7 +104,7 @@ public class ColumnToCollectionType extends AbstractType<ByteBuffer>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         throw new UnsupportedOperationException();
     }

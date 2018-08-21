@@ -18,19 +18,18 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
 import com.google.common.base.Joiner;
+import com.google.common.collect.ImmutableList;
 
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.ByteBufferUtil;
 
-import static org.apache.cassandra.io.sstable.IndexHelper.IndexInfo;
+import org.apache.cassandra.io.sstable.IndexInfo;
 
 /**
  * A comparator of clustering prefixes (or more generally of {@link Clusterable}}.
@@ -42,7 +41,6 @@ import static org.apache.cassandra.io.sstable.IndexHelper.IndexInfo;
 public class ClusteringComparator implements Comparator<Clusterable>
 {
     private final List<AbstractType<?>> clusteringTypes;
-    private final boolean isByteOrderComparable;
 
     private final Comparator<IndexInfo> indexComparator;
     private final Comparator<IndexInfo> indexReverseComparator;
@@ -52,25 +50,19 @@ public class ClusteringComparator implements Comparator<Clusterable>
 
     public ClusteringComparator(AbstractType<?>... clusteringTypes)
     {
-        this(Arrays.asList(clusteringTypes));
+        this(ImmutableList.copyOf(clusteringTypes));
     }
 
     public ClusteringComparator(List<AbstractType<?>> clusteringTypes)
     {
-        this.clusteringTypes = clusteringTypes;
-        this.isByteOrderComparable = isByteOrderComparable(clusteringTypes);
+        // copy the list to ensure despatch is monomorphic
+        this.clusteringTypes = ImmutableList.copyOf(clusteringTypes);
 
         this.indexComparator = (o1, o2) -> ClusteringComparator.this.compare(o1.lastName, o2.lastName);
         this.indexReverseComparator = (o1, o2) -> ClusteringComparator.this.compare(o1.firstName, o2.firstName);
         this.reverseComparator = (c1, c2) -> ClusteringComparator.this.compare(c2, c1);
-    }
-
-    private static boolean isByteOrderComparable(Iterable<AbstractType<?>> types)
-    {
-        boolean isByteOrderComparable = true;
-        for (AbstractType<?> type : types)
-            isByteOrderComparable &= type.isByteOrderComparable();
-        return isByteOrderComparable;
+        for (AbstractType<?> type : clusteringTypes)
+            type.checkComparable(); // this should already be enforced by CFMetaData.rebuild, but we check again for other constructors
     }
 
     /**
@@ -152,7 +144,21 @@ public class ClusteringComparator implements Comparator<Clusterable>
 
     public int compare(Clustering c1, Clustering c2)
     {
-        for (int i = 0; i < size(); i++)
+        return compare(c1, c2, size());
+    }
+
+    /**
+     * Compares the specified part of the specified clusterings.
+     *
+     * @param c1 the first clustering
+     * @param c2 the second clustering
+     * @param size the number of components to compare
+     * @return a negative integer, zero, or a positive integer as the first argument is less than,
+     * equal to, or greater than the second.
+     */
+    public int compare(Clustering c1, Clustering c2, int size)
+    {
+        for (int i = 0; i < size; i++)
         {
             int cmp = compareComponent(i, c1.get(i), c2.get(i));
             if (cmp != 0)
@@ -168,9 +174,7 @@ public class ClusteringComparator implements Comparator<Clusterable>
         if (v2 == null)
             return 1;
 
-        return isByteOrderComparable
-             ? ByteBufferUtil.compareUnsigned(v1, v2)
-             : clusteringTypes.get(i).compare(v1, v2);
+        return clusteringTypes.get(i).compare(v1, v2);
     }
 
     /**

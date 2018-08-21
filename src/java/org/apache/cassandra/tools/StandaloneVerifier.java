@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -47,6 +47,8 @@ public class StandaloneVerifier
     public static void main(String args[])
     {
         Options options = Options.parseArgs(args);
+        Util.initDatabaseDescriptor();
+
         try
         {
             // load keyspace descriptions.

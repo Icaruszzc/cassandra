@@ -25,19 +25,28 @@ import java.util.Collections;
 import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.gms.IFailureDetector;
 import org.apache.cassandra.metrics.HintedHandoffMetrics;
 import org.apache.cassandra.metrics.StorageMetrics;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
 
+import static com.google.common.collect.Iterables.filter;
 import static com.google.common.collect.Iterables.transform;
 import static com.google.common.collect.Iterables.size;
 
@@ -54,11 +63,12 @@ public final class HintsService implements HintsServiceMBean
 {
     private static final Logger logger = LoggerFactory.getLogger(HintsService.class);
 
-    public static final HintsService instance = new HintsService();
+    public static HintsService instance = new HintsService();
 
     private static final String MBEAN_NAME = "org.apache.cassandra.hints:type=HintsService";
 
     private static final int MIN_BUFFER_SIZE = 32 << 20;
+    static final ImmutableMap<String, Object> EMPTY_PARAMS = ImmutableMap.of();
 
     private final HintsCatalog catalog;
     private final HintsWriteExecutor writeExecutor;
@@ -75,17 +85,23 @@ public final class HintsService implements HintsServiceMBean
 
     private HintsService()
     {
+        this(FailureDetector.instance);
+    }
+
+    @VisibleForTesting
+    HintsService(IFailureDetector failureDetector)
+    {
         File hintsDirectory = DatabaseDescriptor.getHintsDirectory();
         int maxDeliveryThreads = DatabaseDescriptor.getMaxHintsDeliveryThreads();
 
-        catalog = HintsCatalog.load(hintsDirectory);
+        catalog = HintsCatalog.load(hintsDirectory, createDescriptorParams());
         writeExecutor = new HintsWriteExecutor(catalog);
 
         int bufferSize = Math.max(DatabaseDescriptor.getMaxMutationSize() * 2, MIN_BUFFER_SIZE);
         bufferPool = new HintsBufferPool(bufferSize, writeExecutor::flushBuffer);
 
         isDispatchPaused = new AtomicBoolean(true);
-        dispatchExecutor = new HintsDispatchExecutor(hintsDirectory, maxDeliveryThreads, isDispatchPaused);
+        dispatchExecutor = new HintsDispatchExecutor(hintsDirectory, maxDeliveryThreads, isDispatchPaused, failureDetector::isAlive);
 
         // periodically empty the current content of the buffers
         int flushPeriod = DatabaseDescriptor.getHintsFlushPeriodInMS();
@@ -94,6 +110,26 @@ public final class HintsService implements HintsServiceMBean
                                                                                         flushPeriod,
                                                                                         TimeUnit.MILLISECONDS);
         metrics = new HintedHandoffMetrics();
+    }
+
+    private static ImmutableMap<String, Object> createDescriptorParams()
+    {
+        ImmutableMap.Builder<String, Object> builder = ImmutableMap.builder();
+
+        ParameterizedClass compressionConfig = DatabaseDescriptor.getHintsCompression();
+        if (compressionConfig != null)
+        {
+            ImmutableMap.Builder<String, Object> compressorParams = ImmutableMap.builder();
+
+            compressorParams.put(ParameterizedClass.CLASS_NAME, compressionConfig.class_name);
+            if (compressionConfig.parameters != null)
+            {
+                compressorParams.put(ParameterizedClass.PARAMETERS, compressionConfig.parameters);
+            }
+            builder.put(HintsDescriptor.COMPRESSION, compressorParams.build());
+        }
+
+        return builder.build();
     }
 
     public void registerMBean()
@@ -123,8 +159,7 @@ public final class HintsService implements HintsServiceMBean
         // we have to make sure that the HintsStore instances get properly initialized - otherwise dispatch will not trigger
         catalog.maybeLoadStores(hostIds);
 
-        if (hint.isLive())
-            bufferPool.write(hostIds, hint);
+        bufferPool.write(hostIds, hint);
 
         StorageMetrics.totalHints.inc(size(hostIds));
     }
@@ -138,6 +173,21 @@ public final class HintsService implements HintsServiceMBean
     public void write(UUID hostId, Hint hint)
     {
         write(Collections.singleton(hostId), hint);
+    }
+
+    /**
+     * Write a hint for all replicas. Used to re-dispatch hints whose destination is either missing or no longer correct.
+     */
+    void writeForAllReplicas(Hint hint)
+    {
+        String keyspaceName = hint.mutation.getKeyspaceName();
+        Token token = hint.mutation.key().getToken();
+
+        Iterable<UUID> hostIds =
+        transform(filter(StorageService.instance.getNaturalAndPendingEndpoints(keyspaceName, token), StorageProxy::shouldHint),
+                  StorageService.instance::getHostIdForEndpoint);
+
+        write(hostIds, hint);
     }
 
     /**
@@ -183,7 +233,7 @@ public final class HintsService implements HintsServiceMBean
      * Will abort dispatch sessions that are currently in progress (which is okay, it's idempotent),
      * and make sure the buffers are flushed, hints files written and fsynced.
      */
-    public synchronized void shutdownBlocking()
+    public synchronized void shutdownBlocking() throws ExecutionException, InterruptedException
     {
         if (isShutDown)
             throw new IllegalStateException("HintsService has already been shut down");
@@ -195,16 +245,11 @@ public final class HintsService implements HintsServiceMBean
 
         triggerFlushingFuture.cancel(false);
 
-        writeExecutor.flushBufferPool(bufferPool);
-        writeExecutor.closeAllWriters();
+        writeExecutor.flushBufferPool(bufferPool).get();
+        writeExecutor.closeAllWriters().get();
 
         dispatchExecutor.shutdownBlocking();
         writeExecutor.shutdownBlocking();
-    }
-
-    public void decommission()
-    {
-        resumeDispatch();
     }
 
     /**
@@ -250,10 +295,11 @@ public final class HintsService implements HintsServiceMBean
     /**
      * Cleans up hints-related state after a node with id = hostId left.
      *
-     * Dispatcher should stop itself (isHostAlive() will start returning false for the leaving host), but we'll wait for
-     * completion anyway.
+     * Dispatcher can not stop itself (isHostAlive() can not start returning false for the leaving host because this
+     * method is called by the same thread as gossip, which blocks gossip), so we can't simply wait for
+     * completion.
      *
-     * We should also flush the buffer is there are any thints for the node there, and close the writer (if any),
+     * We should also flush the buffer if there are any hints for the node there, and close the writer (if any),
      * so that we don't leave any hint files lying around.
      *
      * Once that is done, we can simply delete all hint files and remove the host id from the catalog.
@@ -264,7 +310,7 @@ public final class HintsService implements HintsServiceMBean
      */
     public void excise(UUID hostId)
     {
-        HintsStore store = catalog.get(hostId);
+        HintsStore store = catalog.getNullable(hostId);
         if (store == null)
             return;
 
@@ -282,10 +328,62 @@ public final class HintsService implements HintsServiceMBean
             throw new RuntimeException(e);
         }
 
-        // wait for the current dispatch session to end (if any), so that the currently dispatched file gets removed
-        dispatchExecutor.completeDispatchBlockingly(store);
+        // interrupt the current dispatch session to end (if any), so that the currently dispatched file gets removed
+        dispatchExecutor.interruptDispatch(store.hostId);
 
         // delete all the hints files and remove the HintsStore instance from the map in the catalog
         catalog.exciseStore(hostId);
+    }
+
+    /**
+     * Transfer all local hints to the hostId supplied by hostIdSupplier
+     *
+     * Flushes the buffer to make sure all hints are on disk and closes the hint writers
+     * so we don't leave any hint files around.
+     *
+     * After that, we serially dispatch all the hints in the HintsCatalog.
+     *
+     * If we fail delivering all hints, we will ask the hostIdSupplier for a new target host
+     * and retry delivering any remaining hints there, once, with a delay of 10 seconds before retrying.
+     *
+     * @param hostIdSupplier supplier of stream target host ids. This is generally
+     *                       the closest one according to the DynamicSnitch
+     * @return When this future is done, it either has streamed all hints to remote nodes or has failed with a proper
+     *         log message
+     */
+    public Future transferHints(Supplier<UUID> hostIdSupplier)
+    {
+        Future flushFuture = writeExecutor.flushBufferPool(bufferPool);
+        Future closeFuture = writeExecutor.closeAllWriters();
+        try
+        {
+            flushFuture.get();
+            closeFuture.get();
+        }
+        catch (InterruptedException | ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
+
+        // unpause dispatch, or else transfer() will return immediately
+        resumeDispatch();
+
+        // wait for the current dispatch session to end
+        catalog.stores().forEach(dispatchExecutor::completeDispatchBlockingly);
+
+        return dispatchExecutor.transfer(catalog, hostIdSupplier);
+    }
+
+    HintsCatalog getCatalog()
+    {
+        return catalog;
+    }
+
+    /**
+     * Returns true in case service is shut down.
+     */
+    public boolean isShutDown()
+    {
+        return isShutDown;
     }
 }

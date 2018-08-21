@@ -25,13 +25,14 @@ import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.CounterSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class CounterColumnType extends AbstractType<Long>
 {
     public static final CounterColumnType instance = new CounterColumnType();
 
-    CounterColumnType() {} // singleton
+    CounterColumnType() {super(ComparisonType.NOT_COMPARABLE);} // singleton
 
     public boolean isEmptyValueMeaningless()
     {
@@ -41,11 +42,6 @@ public class CounterColumnType extends AbstractType<Long>
     public boolean isCounter()
     {
         return true;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        throw new AssertionError();
     }
 
     @Override
@@ -66,11 +62,6 @@ public class CounterColumnType extends AbstractType<Long>
         CounterContext.instance().validateContext(cellValue);
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
-    {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
-
     public String getString(ByteBuffer bytes)
     {
         return ByteBufferUtil.bytesToHex(bytes);
@@ -88,7 +79,7 @@ public class CounterColumnType extends AbstractType<Long>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return CounterSerializer.instance.deserialize(buffer).toString();
     }

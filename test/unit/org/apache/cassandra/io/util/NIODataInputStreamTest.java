@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.io.util;
 
 import java.io.ByteArrayInputStream;
@@ -14,7 +34,6 @@ import java.util.ArrayDeque;
 import java.util.Queue;
 import java.util.Random;
 
-import org.apache.cassandra.io.util.NIODataInputStream;
 import org.junit.Test;
 
 import com.google.common.base.Charsets;
@@ -180,17 +199,10 @@ public class NIODataInputStreamTest
     }
 
     @SuppressWarnings("resource")
-    @Test(expected = IllegalArgumentException.class)
-    public void testTooSmallBufferSize() throws Exception
-    {
-        new NIODataInputStream(new FakeChannel(), 4);
-    }
-
-    @SuppressWarnings("resource")
     @Test(expected = NullPointerException.class)
     public void testNullRBC() throws Exception
     {
-        new NIODataInputStream(null, 8);
+        new NIODataInputStream(null, 9);
     }
 
     @SuppressWarnings("resource")
@@ -769,7 +781,7 @@ public class NIODataInputStreamTest
                 out.writeUnsignedVInt(value);
 
                 buf.position(ii);
-                NIODataInputStream in = new DataInputBuffer(buf, false);
+                RebufferingInputStream in = new DataInputBuffer(buf, false);
 
                 assertEquals(value, in.readUnsignedVInt());
             }
@@ -792,7 +804,7 @@ public class NIODataInputStreamTest
             out.writeUnsignedVInt(value);
 
             buf.position(0);
-            NIODataInputStream in = new DataInputBuffer(buf, false);
+            RebufferingInputStream in = new DataInputBuffer(buf, false);
 
             assertEquals(value, in.readUnsignedVInt());
 
@@ -831,7 +843,7 @@ public class NIODataInputStreamTest
             truncated.put(buf);
             truncated.flip();
 
-            NIODataInputStream in = new DataInputBuffer(truncated, false);
+            RebufferingInputStream in = new DataInputBuffer(truncated, false);
 
             boolean threw = false;
             try

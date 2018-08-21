@@ -22,17 +22,20 @@ import java.security.MessageDigest;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import com.google.common.collect.AbstractIterator;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.transform.FilteredRows;
+import org.apache.cassandra.db.transform.MoreRows;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.IMergeIterator;
 import org.apache.cassandra.utils.MergeIterator;
-import org.apache.cassandra.utils.memory.AbstractAllocator;
 
 /**
  * Static methods to work with atom iterators.
@@ -43,11 +46,52 @@ public abstract class UnfilteredRowIterators
 
     private UnfilteredRowIterators() {}
 
+    /**
+     * Interface for a listener interested in the result of merging multiple versions of a given row.
+     * <p>
+     * Implementors of this interface are given enough information that they can easily reconstruct the difference
+     * between the merged result and each individual input. This is used when reconciling results on replias for
+     * instance to figure out what to send as read-repair to each source.
+     */
     public interface MergeListener
     {
+        /**
+         * Called once for the merged partition.
+         *
+         * @param mergedDeletion the partition level deletion for the merged partition. Implementors can test if the
+         * merged partition actually has a partition level deletion or not by calling {@code mergedDeletion.isLive()}.
+         * @param versions the partition level deletion for the sources of the merge. Elements of the array will never
+         * be null, but be "live".
+         **/
         public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions);
 
-        public void onMergedRows(Row merged, Columns columns, Row[] versions);
+        /**
+         * Called once for every row participating in the merge.
+         * <p>
+         * Note that this is called for every clustering where at least one of the source merged has a row. In
+         * particular, this may be called in cases where there is no row in the merged output (if a source has a row
+         * that is shadowed by another source range tombstone or partition level deletion).
+         *
+         * @param merged the result of the merge. This cannot be {@code null} but can be empty, in which case this is a
+         * placeholder for when at least one source has a row, but that row is shadowed in the merged output.
+         * @param versions for each source, the row in that source corresponding to {@code merged}. This can be
+         * {@code null} for some sources if the source has not such row.
+         */
+        public void onMergedRows(Row merged, Row[] versions);
+
+        /**
+         * Called once for every range tombstone marker participating in the merge.
+         * <p>
+         * Note that this is called for every "clustering position" where at least one of the source merged has a range
+         * tombstone marker.
+         *
+         * @param merged the marker in the merged output. This can be {@code null} if there is no such marker, which
+         * means that at least one source has a marker in {@code versions} but the merged out has nothing corresponding
+         * (this basically mean the merged output has a currently open deletion that shadows whatever marker the source
+         * had).
+         * @param versions the marker for each source merged. This can be {@code null} for some source if that source
+         * has not such marker.
+         */
         public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions);
 
         public void close();
@@ -62,8 +106,7 @@ public abstract class UnfilteredRowIterators
      */
     public static RowIterator filter(UnfilteredRowIterator iter, int nowInSec)
     {
-        return new FilteringIterator(iter, nowInSec);
-
+        return FilteredRows.filter(iter, nowInSec);
     }
 
     /**
@@ -89,81 +132,72 @@ public abstract class UnfilteredRowIterators
         return UnfilteredRowMergeIterator.create(iterators, nowInSec, mergeListener);
     }
 
-    public static UnfilteredRowIterator emptyIterator(final CFMetaData cfm, final DecoratedKey partitionKey, final boolean isReverseOrder)
-    {
-        return noRowsIterator(cfm, partitionKey, Rows.EMPTY_STATIC_ROW, DeletionTime.LIVE, isReverseOrder);
-    }
     /**
-     * Returns an empty atom iterator for a given partition.
+     * Returns an empty unfiltered iterator for a given partition.
      */
     public static UnfilteredRowIterator noRowsIterator(final CFMetaData cfm, final DecoratedKey partitionKey, final Row staticRow, final DeletionTime partitionDeletion, final boolean isReverseOrder)
     {
-        return new UnfilteredRowIterator()
+        return EmptyIterators.unfilteredRow(cfm, partitionKey, isReverseOrder, staticRow, partitionDeletion);
+    }
+
+    public static UnfilteredRowIterator singleton(Unfiltered unfiltered,
+                                                  CFMetaData metadata,
+                                                  DecoratedKey partitionKey,
+                                                  DeletionTime partitionLevelDeletion,
+                                                  PartitionColumns columns,
+                                                  Row staticRow,
+                                                  boolean isReverseOrder,
+                                                  EncodingStats encodingStats)
+    {
+        return new AbstractUnfilteredRowIterator(metadata, partitionKey, partitionLevelDeletion, columns, staticRow, isReverseOrder, encodingStats)
         {
-            public CFMetaData metadata()
-            {
-                return cfm;
-            }
+            boolean isDone = false;
 
-            public boolean isReverseOrder()
+            protected Unfiltered computeNext()
             {
-                return isReverseOrder;
-            }
+                if (!isDone)
+                {
+                    isDone = true;
+                    return unfiltered;
+                }
 
-            public PartitionColumns columns()
-            {
-                return PartitionColumns.NONE;
-            }
-
-            public DecoratedKey partitionKey()
-            {
-                return partitionKey;
-            }
-
-            public DeletionTime partitionLevelDeletion()
-            {
-                return partitionDeletion;
-            }
-
-            public Row staticRow()
-            {
-                return staticRow;
-            }
-
-            public EncodingStats stats()
-            {
-                return EncodingStats.NO_STATS;
-            }
-
-            public boolean hasNext()
-            {
-                return false;
-            }
-
-            public Unfiltered next()
-            {
-                throw new NoSuchElementException();
-            }
-
-            public void remove()
-            {
-            }
-
-            public void close()
-            {
+                return endOfData();
             }
         };
     }
 
-    public static void digest(UnfilteredRowIterator iterator, MessageDigest digest)
+    /**
+     * Digests the partition represented by the provided iterator.
+     *
+     * @param command the command that has yield {@code iterator}. This can be null if {@code version >= MessagingService.VERSION_30}
+     * as this is only used when producing digest to be sent to legacy nodes.
+     * @param iterator the iterator to digest.
+     * @param digest the {@code MessageDigest} to use for the digest.
+     * @param version the messaging protocol to use when producing the digest.
+     */
+    public static void digest(ReadCommand command, UnfilteredRowIterator iterator, MessageDigest digest, int version)
     {
-        // TODO: we're not computing digest the same way that old nodes. This
-        // means we'll have digest mismatches during upgrade. We should pass the messaging version of
-        // the node this is for (which might mean computing the digest last, and won't work
-        // for schema (where we announce the version through gossip to everyone))
+        if (version < MessagingService.VERSION_30)
+        {
+            LegacyLayout.fromUnfilteredRowIterator(command, iterator).digest(iterator.metadata(), digest);
+            return;
+        }
+
         digest.update(iterator.partitionKey().getKey().duplicate());
         iterator.partitionLevelDeletion().digest(digest);
-        iterator.columns().digest(digest);
+        iterator.columns().regulars.digest(digest);
+        // When serializing an iterator, we skip the static columns if the iterator has not static row, even if the
+        // columns() object itself has some (the columns() is a superset of what the iterator actually contains, and
+        // will correspond to the queried columns pre-serialization). So we must avoid taking the satic column names
+        // into account if there is no static row or we'd have a digest mismatch between depending on whether the digest
+        // is computed on an iterator that has been serialized or not (see CASSANDRA-12090)
+        // TODO: in practice we could completely skip digesting the columns since they are more informative of what the
+        // iterator may contain, and digesting the actual content is enough. And in fact, that would be more correct
+        // (since again, the columns could be different without the information represented by the iterator being
+        // different), but removing them entirely is stricly speaking a breaking change (it would create mismatches on
+        // upgrade) so we can only do on the next protocol version bump.
+        if (iterator.staticRow() != Rows.EMPTY_STATIC_ROW)
+            iterator.columns().statics.digest(digest);
         FBUtilities.updateWithBoolean(digest, iterator.isReverseOrder());
         iterator.staticRow().digest(digest);
 
@@ -172,6 +206,23 @@ public abstract class UnfilteredRowIterators
             Unfiltered unfiltered = iterator.next();
             unfiltered.digest(digest);
         }
+    }
+
+    /**
+     * Filter the provided iterator to exclude cells that have been fetched but are not queried by the user
+     * (see ColumnFilter for detailes).
+     *
+     * @param iterator the iterator to filter.
+     * @param filter the {@code ColumnFilter} to use when deciding which columns are the one queried by the
+     * user. This should be the filter that was used when querying {@code iterator}.
+     * @return the filtered iterator..
+     */
+    public static UnfilteredRowIterator withOnlyQueriedData(UnfilteredRowIterator iterator, ColumnFilter filter)
+    {
+        if (filter.allFetchedColumnsAreQueried())
+            return iterator;
+
+        return Transformation.apply(iterator, new WithOnlyQueriedData(filter));
     }
 
     /**
@@ -186,66 +237,47 @@ public abstract class UnfilteredRowIterators
             && iter1.partitionKey().equals(iter2.partitionKey())
             && iter1.partitionLevelDeletion().equals(iter2.partitionLevelDeletion())
             && iter1.isReverseOrder() == iter2.isReverseOrder()
-            && iter1.columns().equals(iter2.columns())
             && iter1.staticRow().equals(iter2.staticRow());
 
-        return new AbstractUnfilteredRowIterator(iter1.metadata(),
-                                                 iter1.partitionKey(),
-                                                 iter1.partitionLevelDeletion(),
-                                                 iter1.columns(),
-                                                 iter1.staticRow(),
-                                                 iter1.isReverseOrder(),
-                                                 iter1.stats())
+        class Extend implements MoreRows<UnfilteredRowIterator>
         {
-            protected Unfiltered computeNext()
+            boolean returned = false;
+            public UnfilteredRowIterator moreContents()
             {
-                if (iter1.hasNext())
-                    return iter1.next();
-
-                return iter2.hasNext() ? iter2.next() : endOfData();
+                if (returned)
+                    return null;
+                returned = true;
+                return iter2;
             }
+        }
 
-            @Override
-            public void close()
-            {
-                try
-                {
-                    iter1.close();
-                }
-                finally
-                {
-                    iter2.close();
-                }
-            }
-        };
+        return MoreRows.extend(iter1, new Extend(), iter1.columns().mergeTo(iter2.columns()));
     }
 
-    public static UnfilteredRowIterator cloningIterator(UnfilteredRowIterator iterator, final AbstractAllocator allocator)
+    /**
+     * Returns an iterator that concatenate the specified atom with the iterator.
+     */
+    public static UnfilteredRowIterator concat(final Unfiltered first, final UnfilteredRowIterator rest)
     {
-        return new AlteringUnfilteredRowIterator(iterator)
+        return new WrappingUnfilteredRowIterator(rest)
         {
-            private Row.Builder regularBuilder;
+            private boolean hasReturnedFirst;
 
             @Override
-            protected Row computeNextStatic(Row row)
+            public boolean hasNext()
             {
-                Row.Builder staticBuilder = allocator.cloningBTreeRowBuilder(columns().statics);
-                return Rows.copy(row, staticBuilder).build();
+                return hasReturnedFirst ? super.hasNext() : true;
             }
 
             @Override
-            protected Row computeNext(Row row)
+            public Unfiltered next()
             {
-                if (regularBuilder == null)
-                    regularBuilder = allocator.cloningBTreeRowBuilder(columns().regulars);
-
-                return Rows.copy(row, regularBuilder).build();
-            }
-
-            @Override
-            protected RangeTombstoneMarker computeNext(RangeTombstoneMarker marker)
-            {
-                return marker.copy(allocator);
+                if (!hasReturnedFirst)
+                {
+                    hasReturnedFirst = true;
+                    return first;
+                }
+                return super.next();
             }
         };
     }
@@ -265,24 +297,24 @@ public abstract class UnfilteredRowIterators
      */
     public static UnfilteredRowIterator withValidation(UnfilteredRowIterator iterator, final String filename)
     {
-        return new AlteringUnfilteredRowIterator(iterator)
+        class Validator extends Transformation
         {
             @Override
-            protected Row computeNextStatic(Row row)
+            public Row applyToStatic(Row row)
             {
                 validate(row);
                 return row;
             }
 
             @Override
-            protected Row computeNext(Row row)
+            public Row applyToRow(Row row)
             {
                 validate(row);
                 return row;
             }
 
             @Override
-            protected RangeTombstoneMarker computeNext(RangeTombstoneMarker marker)
+            public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
             {
                 validate(marker);
                 return marker;
@@ -299,7 +331,8 @@ public abstract class UnfilteredRowIterators
                     throw new CorruptSSTableException(me, filename);
                 }
             }
-        };
+        }
+        return Transformation.apply(iterator, new Validator());
     }
 
     /**
@@ -319,30 +352,31 @@ public abstract class UnfilteredRowIterators
                     iterator.isReverseOrder(),
                     iterator.partitionLevelDeletion().markedForDeleteAt());
 
-        return new AlteringUnfilteredRowIterator(iterator)
+        class Logger extends Transformation
         {
             @Override
-            protected Row computeNextStatic(Row row)
+            public Row applyToStatic(Row row)
             {
                 if (!row.isEmpty())
-                    logger.info("[{}] {}", id, row.toString(metadata(), fullDetails));
+                    logger.info("[{}] {}", id, row.toString(metadata, fullDetails));
                 return row;
             }
 
             @Override
-            protected Row computeNext(Row row)
+            public Row applyToRow(Row row)
             {
-                logger.info("[{}] {}", id, row.toString(metadata(), fullDetails));
+                logger.info("[{}] {}", id, row.toString(metadata, fullDetails));
                 return row;
             }
 
             @Override
-            protected RangeTombstoneMarker computeNext(RangeTombstoneMarker marker)
+            public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
             {
-                logger.info("[{}] {}", id, marker.toString(metadata()));
+                logger.info("[{}] {}", id, marker.toString(metadata));
                 return marker;
             }
-        };
+        }
+        return Transformation.apply(iterator, new Logger());
     }
 
     /**
@@ -365,7 +399,7 @@ public abstract class UnfilteredRowIterators
                   iterators.get(0).partitionKey(),
                   partitionDeletion,
                   columns,
-                  mergeStaticRows(metadata, iterators, columns.statics, nowInSec, listener, partitionDeletion),
+                  mergeStaticRows(iterators, columns.statics, nowInSec, listener, partitionDeletion),
                   reversed,
                   mergeStats(iterators));
 
@@ -433,13 +467,12 @@ public abstract class UnfilteredRowIterators
                 if (!delTime.supersedes(iterDeletion))
                     delTime = iterDeletion;
             }
-            if (listener != null && !delTime.isLive())
+            if (listener != null)
                 listener.onMergedPartitionLevelDeletion(delTime, versions);
             return delTime;
         }
 
-        private static Row mergeStaticRows(CFMetaData metadata,
-                                           List<UnfilteredRowIterator> iterators,
+        private static Row mergeStaticRows(List<UnfilteredRowIterator> iterators,
                                            Columns columns,
                                            int nowInSec,
                                            MergeListener listener,
@@ -451,7 +484,7 @@ public abstract class UnfilteredRowIterators
             if (iterators.stream().allMatch(iter -> iter.staticRow().isEmpty()))
                 return Rows.EMPTY_STATIC_ROW;
 
-            Row.Merger merger = new Row.Merger(iterators.size(), nowInSec, columns);
+            Row.Merger merger = new Row.Merger(iterators.size(), nowInSec, columns.hasComplex());
             for (int i = 0; i < iterators.size(); i++)
                 merger.add(i, iterators.get(i).staticRow());
 
@@ -459,7 +492,7 @@ public abstract class UnfilteredRowIterators
             if (merged == null)
                 merged = Rows.EMPTY_STATIC_ROW;
             if (listener != null)
-                listener.onMergedRows(merged, columns, merger.mergedRows());
+                listener.onMergedRows(merged, merger.mergedRows());
             return merged;
         }
 
@@ -518,7 +551,7 @@ public abstract class UnfilteredRowIterators
 
             private MergeReducer(int size, boolean reversed, int nowInSec, MergeListener listener)
             {
-                this.rowMerger = new Row.Merger(size, nowInSec, columns().regulars);
+                this.rowMerger = new Row.Merger(size, nowInSec, columns().regulars.hasComplex());
                 this.markerMerger = new RangeTombstoneMarker.Merger(size, partitionLevelDeletion(), reversed);
                 this.listener = listener;
             }
@@ -545,13 +578,13 @@ public abstract class UnfilteredRowIterators
                 {
                     Row merged = rowMerger.merge(markerMerger.activeDeletion());
                     if (listener != null)
-                        listener.onMergedRows(merged == null ? BTreeRow.emptyRow(rowMerger.mergedClustering()) : merged, columns().regulars, rowMerger.mergedRows());
+                        listener.onMergedRows(merged == null ? BTreeRow.emptyRow(rowMerger.mergedClustering()) : merged, rowMerger.mergedRows());
                     return merged;
                 }
                 else
                 {
                     RangeTombstoneMarker merged = markerMerger.merge();
-                    if (merged != null && listener != null)
+                    if (listener != null)
                         listener.onMergedRangeTombstoneMarkers(merged, markerMerger.mergedMarkers());
                     return merged;
                 }
@@ -564,68 +597,6 @@ public abstract class UnfilteredRowIterators
                 else
                     markerMerger.clear();
             }
-        }
-    }
-
-    private static class FilteringIterator extends AbstractIterator<Row> implements RowIterator
-    {
-        private final UnfilteredRowIterator iter;
-        private final int nowInSec;
-
-        public FilteringIterator(UnfilteredRowIterator iter, int nowInSec)
-        {
-            this.iter = iter;
-            this.nowInSec = nowInSec;
-        }
-
-        public CFMetaData metadata()
-        {
-            return iter.metadata();
-        }
-
-        public boolean isReverseOrder()
-        {
-            return iter.isReverseOrder();
-        }
-
-        public PartitionColumns columns()
-        {
-            return iter.columns();
-        }
-
-        public DecoratedKey partitionKey()
-        {
-            return iter.partitionKey();
-        }
-
-        public Row staticRow()
-        {
-            Row row = iter.staticRow();
-            if (row.isEmpty())
-                return Rows.EMPTY_STATIC_ROW;
-
-            row = row.purge(DeletionPurger.PURGE_ALL, nowInSec);
-            return row == null ? Rows.EMPTY_STATIC_ROW : row;
-        }
-
-        protected Row computeNext()
-        {
-            while (iter.hasNext())
-            {
-                Unfiltered next = iter.next();
-                if (next.isRangeTombstoneMarker())
-                    continue;
-
-                Row row = ((Row)next).purge(DeletionPurger.PURGE_ALL, nowInSec);
-                if (row != null)
-                    return row;
-            }
-            return endOfData();
-        }
-
-        public void close()
-        {
-            iter.close();
         }
     }
 }

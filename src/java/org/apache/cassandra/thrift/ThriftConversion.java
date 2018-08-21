@@ -26,6 +26,8 @@ import com.google.common.collect.Maps;
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.SuperColumnCompatibility;
+import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.db.CompactTables;
 import org.apache.cassandra.db.LegacyLayout;
 import org.apache.cassandra.db.WriteType;
@@ -33,12 +35,14 @@ import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.locator.LocalStrategy;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
 
 /**
@@ -162,7 +166,7 @@ public class ThriftConversion
     public static KsDef toThrift(KeyspaceMetadata ksm)
     {
         List<CfDef> cfDefs = new ArrayList<>();
-        for (CFMetaData cfm : ksm.tables)
+        for (CFMetaData cfm : ksm.tables) // do not include views
             if (cfm.isThriftCompatible()) // Don't expose CF that cannot be correctly handle by thrift; see CASSANDRA-4377 for further details
                 cfDefs.add(toThrift(cfm));
 
@@ -190,7 +194,7 @@ public class ThriftConversion
     private static boolean isSuper(String thriftColumnType)
     throws org.apache.cassandra.exceptions.InvalidRequestException
     {
-        switch (thriftColumnType.toLowerCase())
+        switch (thriftColumnType.toLowerCase(Locale.ENGLISH))
         {
             case "standard": return false;
             case "super": return true;
@@ -238,7 +242,7 @@ public class ThriftConversion
             // historical reasons)
             boolean hasKeyAlias = cf_def.isSetKey_alias() && keyValidator != null && !(keyValidator instanceof CompositeType);
             if (hasKeyAlias)
-                defs.add(ColumnDefinition.partitionKeyDef(cf_def.keyspace, cf_def.name, UTF8Type.instance.getString(cf_def.key_alias), keyValidator, null));
+                defs.add(ColumnDefinition.partitionKeyDef(cf_def.keyspace, cf_def.name, UTF8Type.instance.getString(cf_def.key_alias), keyValidator, 0));
 
             // Now add any CQL metadata that we want to copy, skipping the keyAlias if there was one
             for (ColumnDefinition def : previousCQLMetadata)
@@ -269,11 +273,12 @@ public class ThriftConversion
                                       hasKeyAlias ? null : keyValidator,
                                       rawComparator,
                                       subComparator,
-                                      defaultValidator);
+                                      defaultValidator,
+                                      isDense);
             }
 
-            // We do not allow Thrift materialized views, so we always set it to false
-            boolean isMaterializedView = false;
+            // We do not allow Thrift views, so we always set it to false
+            boolean isView = false;
 
             CFMetaData newCFMD = CFMetaData.create(cf_def.keyspace,
                                                    cf_def.name,
@@ -282,12 +287,13 @@ public class ThriftConversion
                                                    isCompound,
                                                    isSuper,
                                                    isCounter,
-                                                   isMaterializedView,
+                                                   isView,
                                                    defs,
                                                    DatabaseDescriptor.getPartitioner());
 
             // Convert any secondary indexes defined in the thrift column_metadata
-            newCFMD.indexes(indexDefsFromThrift(cf_def.keyspace,
+            newCFMD.indexes(indexDefsFromThrift(newCFMD,
+                                                cf_def.keyspace,
                                                 cf_def.name,
                                                 rawComparator,
                                                 subComparator,
@@ -363,7 +369,8 @@ public class ThriftConversion
                                               AbstractType<?> keyValidator,
                                               AbstractType<?> comparator,
                                               AbstractType<?> subComparator,
-                                              AbstractType<?> defaultValidator)
+                                              AbstractType<?> defaultValidator,
+                                              boolean isDense)
     {
         CompactTables.DefaultNames names = CompactTables.defaultNameGenerator(defs);
         if (keyValidator != null)
@@ -376,15 +383,20 @@ public class ThriftConversion
             }
             else
             {
-                defs.add(ColumnDefinition.partitionKeyDef(ks, cf, names.defaultPartitionKeyName(), keyValidator, null));
+                defs.add(ColumnDefinition.partitionKeyDef(ks, cf, names.defaultPartitionKeyName(), keyValidator, 0));
             }
         }
 
         if (subComparator != null)
         {
             // SuperColumn tables: we use a special map to hold dynamic values within a given super column
-            defs.add(ColumnDefinition.clusteringKeyDef(ks, cf, names.defaultClusteringName(), comparator, 0));
-            defs.add(ColumnDefinition.regularDef(ks, cf, CompactTables.SUPER_COLUMN_MAP_COLUMN_STR, MapType.getInstance(subComparator, defaultValidator, true)));
+            defs.add(ColumnDefinition.clusteringDef(ks, cf, names.defaultClusteringName(), comparator, 0));
+            defs.add(ColumnDefinition.regularDef(ks, cf, SuperColumnCompatibility.SUPER_COLUMN_MAP_COLUMN_STR, MapType.getInstance(subComparator, defaultValidator, true)));
+            if (isDense)
+            {
+                defs.add(ColumnDefinition.clusteringDef(ks, cf, names.defaultClusteringName(), subComparator, 1));
+                defs.add(ColumnDefinition.regularDef(ks, cf, names.defaultCompactValueName(), defaultValidator));
+            }
         }
         else
         {
@@ -393,7 +405,7 @@ public class ThriftConversion
                                            : Collections.<AbstractType<?>>singletonList(comparator);
 
             for (int i = 0; i < subTypes.size(); i++)
-                defs.add(ColumnDefinition.clusteringKeyDef(ks, cf, names.defaultClusteringName(), subTypes.get(i), i));
+                defs.add(ColumnDefinition.clusteringDef(ks, cf, names.defaultClusteringName(), subTypes.get(i), i));
 
             defs.add(ColumnDefinition.regularDef(ks, cf, names.defaultCompactValueName(), defaultValidator));
         }
@@ -505,7 +517,7 @@ public class ThriftConversion
                                     cfName,
                                     ColumnIdentifier.getInterned(ByteBufferUtil.clone(thriftColumnDef.name), comparator),
                                     TypeParser.parse(thriftColumnDef.validation_class),
-                                    null,
+                                    ColumnDefinition.NO_POSITION,
                                     kind);
     }
 
@@ -526,7 +538,8 @@ public class ThriftConversion
         return defs;
     }
 
-    private static Indexes indexDefsFromThrift(String ksName,
+    private static Indexes indexDefsFromThrift(CFMetaData cfm,
+                                               String ksName,
                                                String cfName,
                                                AbstractType<?> thriftComparator,
                                                AbstractType<?> thriftSubComparator,
@@ -546,7 +559,7 @@ public class ThriftConversion
                 String indexName = def.getIndex_name();
                 // add a generated index name if none was supplied
                 if (Strings.isNullOrEmpty(indexName))
-                    indexName = Indexes.getAvailableIndexName(ksName, cfName, column.name);
+                    indexName = Indexes.getAvailableIndexName(ksName, cfName, column.name.toString());
 
                 if (indexNames.contains(indexName))
                     throw new ConfigurationException("Duplicate index name " + indexName);
@@ -554,12 +567,12 @@ public class ThriftConversion
                 indexNames.add(indexName);
 
                 Map<String, String> indexOptions = def.getIndex_options();
-                IndexMetadata.IndexType indexType = IndexMetadata.IndexType.valueOf(def.index_type.name());
+                if (indexOptions != null && indexOptions.containsKey(IndexTarget.TARGET_OPTION_NAME))
+                        throw new ConfigurationException("Reserved index option 'target' cannot be used");
 
-                indexes.add(IndexMetadata.singleColumnIndex(column,
-                                                            indexName,
-                                                            indexType,
-                                                            indexOptions));
+                IndexMetadata.Kind kind = IndexMetadata.Kind.valueOf(def.index_type.name());
+
+                indexes.add(IndexMetadata.fromLegacyMetadata(cfm, column, indexName, kind, indexOptions));
             }
         }
         return indexes.build();
@@ -572,22 +585,42 @@ public class ThriftConversion
 
         cd.setName(ByteBufferUtil.clone(column.name.bytes));
         cd.setValidation_class(column.type.toString());
-        Collection<IndexMetadata> indexes = cfMetaData.getIndexes().get(column);
-        // we include the index in the ColumnDef iff
-        //   * it is the only index on the column
-        //   * it is the only target column for the index
-        if (indexes.size() == 1)
+
+        // we include the index in the ColumnDef iff its targets are compatible with
+        // pre-3.0 indexes AND it is the only index defined on the given column, that is:
+        //   * it is the only index on the column (i.e. with this column as its target)
+        //   * it has only a single target, which matches the pattern for pre-3.0 indexes
+        //     i.e. keys/values/entries/full, with exactly 1 argument that matches the
+        //     column name OR a simple column name (for indexes on non-collection columns)
+        // n.b. it's a guess that using a pre-compiled regex and checking the group is
+        // cheaper than compiling a new regex for each column, but as this isn't on
+        // any hot path this hasn't been verified yet.
+        IndexMetadata matchedIndex = null;
+        for (IndexMetadata index : cfMetaData.getIndexes())
         {
-            IndexMetadata index = indexes.iterator().next();
-            if (index.columns.size() == 1)
+            Pair<ColumnDefinition, IndexTarget.Type> target  = TargetParser.parse(cfMetaData, index);
+            if (target.left.equals(column))
             {
-                cd.setIndex_type(org.apache.cassandra.thrift.IndexType.valueOf(index.indexType.name()));
-                cd.setIndex_name(index.name);
-                cd.setIndex_options(index.options == null || index.options.isEmpty()
-                                    ? null
-                                    : Maps.newHashMap(index.options));
+                // we already found an index for this column, we've no option but to
+                // ignore both of them (and any others we've yet to find)
+                if (matchedIndex != null)
+                    return cd;
+
+                matchedIndex = index;
             }
         }
+
+        if (matchedIndex != null)
+        {
+            cd.setIndex_type(org.apache.cassandra.thrift.IndexType.valueOf(matchedIndex.kind.name()));
+            cd.setIndex_name(matchedIndex.name);
+            Map<String, String> filteredOptions = Maps.filterKeys(matchedIndex.options,
+                                                                  s -> !IndexTarget.TARGET_OPTION_NAME.equals(s));
+            cd.setIndex_options(filteredOptions.isEmpty()
+                                ? null
+                                : Maps.newHashMap(filteredOptions));
+        }
+
         return cd;
     }
 
@@ -650,7 +683,7 @@ public class ThriftConversion
 
     private static CachingParams cachingFromTrhfit(String caching)
     {
-        switch (caching.toUpperCase())
+        switch (caching.toUpperCase(Locale.ENGLISH))
         {
             case "ALL":
                 return CachingParams.CACHE_EVERYTHING;

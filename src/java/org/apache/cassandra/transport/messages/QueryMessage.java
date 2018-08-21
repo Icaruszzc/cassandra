@@ -17,20 +17,21 @@
  */
 package org.apache.cassandra.transport.messages;
 
-import java.nio.ByteBuffer;
-import java.util.Collections;
 import java.util.UUID;
 
 import com.google.common.collect.ImmutableMap;
-import io.netty.buffer.ByteBuf;
 
+import io.netty.buffer.ByteBuf;
 import org.apache.cassandra.cql3.QueryOptions;
-import org.apache.cassandra.db.ConsistencyLevel;
-import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.transport.*;
+import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.Message;
+import org.apache.cassandra.transport.ProtocolException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -41,34 +42,26 @@ public class QueryMessage extends Message.Request
 {
     public static final Message.Codec<QueryMessage> codec = new Message.Codec<QueryMessage>()
     {
-        public QueryMessage decode(ByteBuf body, int version)
+        public QueryMessage decode(ByteBuf body, ProtocolVersion version)
         {
             String query = CBUtil.readLongString(body);
-            if (version == 1)
-            {
-                ConsistencyLevel consistency = CBUtil.readConsistencyLevel(body);
-                return new QueryMessage(query, QueryOptions.fromProtocolV1(consistency, Collections.<ByteBuffer>emptyList()));
-            }
-            else
-            {
-                return new QueryMessage(query, QueryOptions.codec.decode(body, version));
-            }
+            return new QueryMessage(query, QueryOptions.codec.decode(body, version));
         }
 
-        public void encode(QueryMessage msg, ByteBuf dest, int version)
+        public void encode(QueryMessage msg, ByteBuf dest, ProtocolVersion version)
         {
             CBUtil.writeLongString(msg.query, dest);
-            if (version == 1)
+            if (version == ProtocolVersion.V1)
                 CBUtil.writeConsistencyLevel(msg.options.getConsistency(), dest);
             else
                 QueryOptions.codec.encode(msg.options, dest, version);
         }
 
-        public int encodedSize(QueryMessage msg, int version)
+        public int encodedSize(QueryMessage msg, ProtocolVersion version)
         {
             int size = CBUtil.sizeOfLongString(msg.query);
 
-            if (version == 1)
+            if (version == ProtocolVersion.V1)
             {
                 size += CBUtil.sizeOfConsistencyLevel(msg.options.getConsistency());
             }
@@ -90,7 +83,7 @@ public class QueryMessage extends Message.Request
         this.options = options;
     }
 
-    public Message.Response execute(QueryState state)
+    public Message.Response execute(QueryState state, long queryStartNanoTime)
     {
         try
         {
@@ -106,7 +99,7 @@ public class QueryMessage extends Message.Request
 
             if (state.traceNextQuery())
             {
-                state.createTracingSession();
+                state.createTracingSession(getCustomPayload());
 
                 ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
                 builder.put("query", query);
@@ -120,7 +113,7 @@ public class QueryMessage extends Message.Request
                 Tracing.instance.begin("Execute CQL3 query", state.getClientAddress(), builder.build());
             }
 
-            Message.Response response = ClientState.getCQLQueryHandler().process(query, state, options, getCustomPayload());
+            Message.Response response = ClientState.getCQLQueryHandler().process(query, state, options, getCustomPayload(), queryStartNanoTime);
             if (options.skipMetadata() && response instanceof ResultMessage.Rows)
                 ((ResultMessage.Rows)response).result.metadata.setSkipMetadata();
 

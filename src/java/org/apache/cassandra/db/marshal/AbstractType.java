@@ -18,6 +18,7 @@
 package org.apache.cassandra.db.marshal;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -26,18 +27,26 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cql3.AssignmentTestable;
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.FastByteOperations;
 import org.github.jamm.Unmetered;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.db.marshal.AbstractType.ComparisonType.CUSTOM;
 
 /**
  * Specifies a Comparator for a specific type of ByteBuffer.
@@ -48,28 +57,50 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * represent a valid ByteBuffer for the type being compared.
  */
 @Unmetered
-public abstract class AbstractType<T> implements Comparator<ByteBuffer>
+public abstract class AbstractType<T> implements Comparator<ByteBuffer>, AssignmentTestable
 {
+    private static final Logger logger = LoggerFactory.getLogger(AbstractType.class);
+
     public final Comparator<ByteBuffer> reverseComparator;
 
-    protected AbstractType()
+    public enum ComparisonType
     {
-        reverseComparator = new Comparator<ByteBuffer>()
-        {
-            public int compare(ByteBuffer o1, ByteBuffer o2)
-            {
-                if (o1.remaining() == 0)
-                {
-                    return o2.remaining() == 0 ? 0 : -1;
-                }
-                if (o2.remaining() == 0)
-                {
-                    return 1;
-                }
+        /**
+         * This type should never be compared
+         */
+        NOT_COMPARABLE,
+        /**
+         * This type is always compared by its sequence of unsigned bytes
+         */
+        BYTE_ORDER,
+        /**
+         * This type can only be compared by calling the type's compareCustom() method, which may be expensive.
+         * Support for this may be removed in a major release of Cassandra, however upgrade facilities will be
+         * provided if and when this happens.
+         */
+        CUSTOM
+    }
 
-                return AbstractType.this.compare(o2, o1);
-            }
-        };
+    public final ComparisonType comparisonType;
+    public final boolean isByteOrderComparable;
+
+    protected AbstractType(ComparisonType comparisonType)
+    {
+        this.comparisonType = comparisonType;
+        this.isByteOrderComparable = comparisonType == ComparisonType.BYTE_ORDER;
+        reverseComparator = (o1, o2) -> AbstractType.this.compare(o2, o1);
+        try
+        {
+            Method custom = getClass().getMethod("compareCustom", ByteBuffer.class, ByteBuffer.class);
+            if ((custom.getDeclaringClass() == AbstractType.class) == (comparisonType == CUSTOM))
+                throw new IllegalStateException((comparisonType == CUSTOM ? "compareCustom must be overridden if ComparisonType is CUSTOM"
+                                                                         : "compareCustom should not be overridden if ComparisonType is not CUSTOM")
+                                                + " (" + getClass().getSimpleName() + ")");
+        }
+        catch (NoSuchMethodException e)
+        {
+            throw new IllegalStateException();
+        }
     }
 
     public static List<String> asCQLTypeStringList(List<AbstractType<?>> abstractTypes)
@@ -90,7 +121,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         return getSerializer().serialize(value);
     }
 
-    /** get a string representation of the bytes suitable for log messages */
+    /** get a string representation of the bytes used for various identifier (NOT just for log messages) */
     public String getString(ByteBuffer bytes)
     {
         if (bytes == null)
@@ -110,8 +141,17 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
      **/
     public abstract Term fromJSONObject(Object parsed) throws MarshalException;
 
-    /** Converts a value to a JSON string. */
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    /**
+     * Converts the specified value into its JSON representation.
+     * <p>
+     * The buffer position will stay the same.
+     * </p>
+     *
+     * @param buffer the value to convert
+     * @param protocolVersion the protocol version to use for the conversion
+     * @return a JSON string representing the specified value
+     */
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return '"' + getSerializer().deserialize(buffer).toString() + '"';
     }
@@ -120,6 +160,27 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     public void validate(ByteBuffer bytes) throws MarshalException
     {
         getSerializer().validate(bytes);
+    }
+
+    public final int compare(ByteBuffer left, ByteBuffer right)
+    {
+        return isByteOrderComparable
+               ? FastByteOperations.compareUnsigned(left, right)
+               : compareCustom(left, right);
+    }
+
+    /**
+     * Implement IFF ComparisonType is CUSTOM
+     *
+     * Compares the ByteBuffer representation of two instances of this class,
+     * for types where this cannot be done by simple in-order comparison of the
+     * unsigned bytes
+     *
+     * Standard Java compare semantics
+     */
+    public int compareCustom(ByteBuffer left, ByteBuffer right)
+    {
+        throw new UnsupportedOperationException();
     }
 
     /**
@@ -173,6 +234,11 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     public boolean isFrozenCollection()
     {
         return isCollection() && !isMultiCell();
+    }
+
+    public boolean isReversed()
+    {
+        return false;
     }
 
     public static AbstractType<?> parseDefaultParameters(AbstractType<?> baseType, TypeParser parser) throws SyntaxException
@@ -230,15 +296,6 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     /**
-     * @return true IFF the byte representation of this type can be compared unsigned
-     * and always return the same result as calling this object's compare or compareCollectionMembers methods
-     */
-    public boolean isByteOrderComparable()
-    {
-        return false;
-    }
-
-    /**
      * An alternative comparison function used by CollectionsType in conjunction with CompositeType.
      *
      * This comparator is only called to compare components of a CompositeType. It gets the value of the
@@ -266,12 +323,40 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         return false;
     }
 
+    public boolean isUDT()
+    {
+        return false;
+    }
+
+    public boolean isTuple()
+    {
+        return false;
+    }
+
     public boolean isMultiCell()
     {
         return false;
     }
 
+    public boolean isFreezable()
+    {
+        return false;
+    }
+
     public AbstractType<?> freeze()
+    {
+        return this;
+    }
+
+    /**
+     * Returns an AbstractType instance that is equivalent to this one, but with all nested UDTs and collections
+     * explicitly frozen.
+     *
+     * This is only necessary for {@code 2.x -> 3.x} schema migrations, and can be removed in Cassandra 4.0.
+     *
+     * See CASSANDRA-11609 and CASSANDRA-11613.
+     */
+    public AbstractType<?> freezeNestedMulticellTypes()
     {
         return this;
     }
@@ -311,7 +396,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     /**
-    * The length of values for this type if all values are of fixed length, -1 otherwise.
+     * The length of values for this type if all values are of fixed length, -1 otherwise.
      */
     protected int valueLengthIfFixed()
     {
@@ -338,20 +423,47 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
 
     public ByteBuffer readValue(DataInputPlus in) throws IOException
     {
+        return readValue(in, Integer.MAX_VALUE);
+    }
+
+    public ByteBuffer readValue(DataInputPlus in, int maxValueSize) throws IOException
+    {
         int length = valueLengthIfFixed();
+
         if (length >= 0)
             return ByteBufferUtil.read(in, length);
         else
-            return ByteBufferUtil.readWithVIntLength(in);
+        {
+            int l = (int)in.readUnsignedVInt();
+            if (l < 0)
+                throw new IOException("Corrupt (negative) value length encountered");
+
+            if (l > maxValueSize)
+                throw new IOException(String.format("Corrupt value length %d encountered, as it exceeds the maximum of %d, " +
+                                                    "which is set via max_value_size_in_mb in cassandra.yaml",
+                                                    l, maxValueSize));
+
+            return ByteBufferUtil.read(in, l);
+        }
     }
 
     public void skipValue(DataInputPlus in) throws IOException
     {
         int length = valueLengthIfFixed();
         if (length >= 0)
-            FileUtils.skipBytesFully(in, length);
+            in.skipBytesFully(length);
         else
             ByteBufferUtil.skipWithVIntLength(in);
+    }
+
+    public boolean referencesUserType(String userTypeName)
+    {
+        return false;
+    }
+
+    public boolean referencesDuration()
+    {
+        return false;
     }
 
     /**
@@ -365,5 +477,45 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     public String toString()
     {
         return getClass().getName();
+    }
+
+    /**
+     * Checks to see if two types are equal when ignoring or not ignoring differences in being frozen, depending on
+     * the value of the ignoreFreezing parameter.
+     * @param other type to compare
+     * @param ignoreFreezing if true, differences in the types being frozen will be ignored
+     */
+    public boolean equals(Object other, boolean ignoreFreezing)
+    {
+        return this.equals(other);
+    }
+
+    public void checkComparable()
+    {
+        switch (comparisonType)
+        {
+            case NOT_COMPARABLE:
+                throw new IllegalArgumentException(this + " cannot be used in comparisons, so cannot be used as a clustering column");
+        }
+    }
+
+    public final AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
+    {
+        // We should ignore the fact that the output type is frozen in our comparison as functions do not support
+        // frozen types for arguments
+        AbstractType<?> receiverType = receiver.type;
+        if (isFreezable() && !isMultiCell())
+            receiverType = receiverType.freeze();
+
+        if (isReversed())
+            receiverType = ReversedType.getInstance(receiverType);
+
+        if (equals(receiverType))
+            return AssignmentTestable.TestResult.EXACT_MATCH;
+
+        if (receiverType.isValueCompatibleWith(this))
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+        return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
     }
 }

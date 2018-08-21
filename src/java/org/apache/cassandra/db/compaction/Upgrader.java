@@ -19,11 +19,11 @@ package org.apache.cassandra.db.compaction;
 
 import java.io.File;
 import java.util.*;
+import java.util.function.Predicate;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.Sets;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -76,6 +76,7 @@ public class Upgrader
                                     cfs.metadata,
                                     sstableMetadataCollector,
                                     SerializationHeader.make(cfs.metadata, Sets.newHashSet(sstable)),
+                                    cfs.indexManager.listIndexes(),
                                     transaction);
     }
 
@@ -83,7 +84,7 @@ public class Upgrader
     {
         outputHandler.output("Upgrading " + sstable);
         int nowInSec = FBUtilities.nowInSeconds();
-        try (SSTableRewriter writer = new SSTableRewriter(cfs, transaction, CompactionTask.getMaxDataAge(transaction.originals()), true).keepOriginals(keepOriginals);
+        try (SSTableRewriter writer = SSTableRewriter.construct(cfs, transaction, keepOriginals, CompactionTask.getMaxDataAge(transaction.originals()));
              AbstractCompactionStrategy.ScannerList scanners = strategyManager.getScanners(transaction.originals());
              CompactionIterator iter = new CompactionIterator(transaction.opType(), scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID()))
         {
@@ -112,9 +113,9 @@ public class Upgrader
         }
 
         @Override
-        public long maxPurgeableTimestamp(DecoratedKey key)
+        public Predicate<Long> getPurgeEvaluator(DecoratedKey key)
         {
-            return Long.MIN_VALUE;
+            return time -> false;
         }
     }
 }

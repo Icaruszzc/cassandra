@@ -17,31 +17,36 @@
  */
 package org.apache.cassandra.cql3.validation.entities;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import org.apache.commons.lang3.StringUtils;
+import org.junit.Assert;
+import org.junit.BeforeClass;
+import org.junit.Test;
+
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.service.StorageService;
-import org.apache.commons.lang3.StringUtils;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Test;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
 
 public class FrozenCollectionsTest extends CQLTester
 {
     @BeforeClass
-    public static void setUpClass()
+    public static void setUpClass()     // overrides CQLTester.setUpClass()
     {
         // Selecting partitioner for a table is not exposed on CREATE TABLE.
         StorageService.instance.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
+
+        prepareServer();
     }
 
     @Test
@@ -506,20 +511,6 @@ public class FrozenCollectionsTest extends CQLTester
         }
     }
 
-    private void assertInvalidAlterWithMessage(String createTableStatement, String errorMessage) throws Throwable
-    {
-        try
-        {
-            alterTableMayThrow(createTableStatement);
-            Assert.fail("Expected CREATE TABLE statement to error: " + createTableStatement);
-        }
-        catch (InvalidRequestException | ConfigurationException ex)
-        {
-            Assert.assertTrue("Expected error message to contain '" + errorMessage + "', but got '" + ex.getMessage() + "'",
-                    ex.getMessage().contains(errorMessage));
-        }
-    }
-
     @Test
     public void testInvalidOperations() throws Throwable
     {
@@ -552,34 +543,6 @@ public class FrozenCollectionsTest extends CQLTester
                 "frozen<> is only allowed on collections, tuples, and user-defined types");
     }
 
-    @Test
-    public void testAltering() throws Throwable
-    {
-        createTable("CREATE TABLE %s (a int, b frozen<list<int>>, c frozen<list<int>>, PRIMARY KEY (a, b))");
-
-        alterTable("ALTER TABLE %s ALTER c TYPE frozen<list<blob>>");
-
-        assertInvalidAlterWithMessage("ALTER TABLE %s ALTER b TYPE frozen<list<blob>>",
-                                      "types are not order-compatible");
-
-        assertInvalidAlterWithMessage("ALTER TABLE %s ALTER b TYPE list<int>",
-                                      "types are not order-compatible");
-
-        assertInvalidAlterWithMessage("ALTER TABLE %s ALTER c TYPE list<blob>",
-                                      "types are incompatible");
-
-        alterTable("ALTER TABLE %s DROP c");
-        alterTable("ALTER TABLE %s ADD c frozen<set<int>>");
-        assertInvalidAlterWithMessage("ALTER TABLE %s ALTER c TYPE frozen<set<blob>>",
-                                      "types are incompatible");
-
-        alterTable("ALTER TABLE %s DROP c");
-        alterTable("ALTER TABLE %s ADD c frozen<map<int, int>>");
-        assertInvalidAlterWithMessage("ALTER TABLE %s ALTER c TYPE frozen<map<blob, int>>",
-                                      "types are incompatible");
-        alterTable("ALTER TABLE %s ALTER c TYPE frozen<map<int, blob>>");
-    }
-
     private void assertInvalidIndexCreationWithMessage(String statement, String errorMessage) throws Throwable
     {
         try
@@ -601,8 +564,9 @@ public class FrozenCollectionsTest extends CQLTester
 
         // for now, we don't support indexing values or keys of collections in the primary key
         assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (full(a))", "Cannot create secondary index on partition key column");
-        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(a))", "Cannot create index on keys of frozen<map> column");
-        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(b))", "Cannot create index on keys of frozen<map> column");
+        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(a))", "Cannot create secondary index on partition key column");
+        assertInvalidIndexCreationWithMessage("CREATE INDEX ON %s (keys(b))", "Cannot create keys() index on frozen column b. " +
+                                                                              "Frozen collections only support full() indexes");
 
         createTable("CREATE TABLE %s (a int, b frozen<list<int>>, c frozen<set<int>>, d frozen<map<int, text>>, PRIMARY KEY (a, b))");
 
@@ -626,17 +590,18 @@ public class FrozenCollectionsTest extends CQLTester
                              "SELECT * FROM %s WHERE c CONTAINS KEY ?", 1);
 
         // normal indexes on frozen collections don't support CONTAINS or CONTAINS KEY
-        assertInvalidMessage("Cannot restrict clustering columns by a CONTAINS relation without a secondary index",
+        assertInvalidMessage("Clustering columns can only be restricted with CONTAINS with a secondary index or filtering",
                              "SELECT * FROM %s WHERE b CONTAINS ?", 1);
 
-        assertInvalidMessage("Cannot restrict clustering columns by a CONTAINS relation without a secondary index",
-                             "SELECT * FROM %s WHERE b CONTAINS ? ALLOW FILTERING", 1);
+        assertRows(execute("SELECT * FROM %s WHERE b CONTAINS ? ALLOW FILTERING", 1),
+                   row(0, list(1, 2, 3), set(1, 2, 3), map(1, "a")),
+                   row(1, list(1, 2, 3), set(4, 5, 6), map(2, "b")));
 
-        assertInvalidMessage("No supported secondary index found for the non primary key columns restrictions",
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE d CONTAINS KEY ?", 1);
 
-        assertInvalidMessage("Cannot restrict clustering columns by a CONTAINS relation without a secondary index",
-                             "SELECT * FROM %s WHERE b CONTAINS ? AND d CONTAINS KEY ? ALLOW FILTERING", 1, 1);
+        assertRows(execute("SELECT * FROM %s WHERE b CONTAINS ? AND d CONTAINS KEY ? ALLOW FILTERING", 1, 1),
+                   row(0, list(1, 2, 3), set(1, 2, 3), map(1, "a")));
 
         // index lookup on b
         assertRows(execute("SELECT * FROM %s WHERE b=?", list(1, 2, 3)),
@@ -1110,5 +1075,102 @@ public class FrozenCollectionsTest extends CQLTester
         types.add(SetType.getInstance(Int32Type.instance, true));
         TupleType tuple = new TupleType(types);
         assertEquals("TupleType(SetType(Int32Type))", clean(tuple.toString()));
+    }
+
+    @Test
+    public void testListWithElementsBiggerThan64K() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, l frozen<list<text>>)");
+
+        byte[] bytes = new byte[FBUtilities.MAX_UNSIGNED_SHORT + 10];
+        Arrays.fill(bytes, (byte) 1);
+        String largeText = new String(bytes);
+
+        execute("INSERT INTO %s(k, l) VALUES (0, ?)", list(largeText, "v2"));
+        flush();
+
+        assertRows(execute("SELECT l FROM %s WHERE k = 0"), row(list(largeText, "v2")));
+
+        // Full overwrite
+        execute("UPDATE %s SET l = ? WHERE k = 0", list("v1", largeText));
+        flush();
+
+        assertRows(execute("SELECT l FROM %s WHERE k = 0"), row(list("v1", largeText)));
+
+        execute("DELETE l FROM %s WHERE k = 0");
+
+        assertRows(execute("SELECT l FROM %s WHERE k = 0"), row((Object) null));
+
+        execute("INSERT INTO %s(k, l) VALUES (0, ['" + largeText + "', 'v2'])");
+        flush();
+
+        assertRows(execute("SELECT l FROM %s WHERE k = 0"), row(list(largeText, "v2")));
+    }
+
+    @Test
+    public void testMapsWithElementsBiggerThan64K() throws Throwable
+    {
+        byte[] bytes = new byte[FBUtilities.MAX_UNSIGNED_SHORT + 10];
+        Arrays.fill(bytes, (byte) 1);
+        String largeText = new String(bytes);
+
+        bytes = new byte[FBUtilities.MAX_UNSIGNED_SHORT + 10];
+        Arrays.fill(bytes, (byte) 2);
+        String largeText2 = new String(bytes);
+
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, m frozen<map<text, text>>)");
+
+        execute("INSERT INTO %s(k, m) VALUES (0, ?)", map(largeText, "v1", "k2", largeText));
+        flush();
+
+        assertRows(execute("SELECT m FROM %s WHERE k = 0"),
+            row(map(largeText, "v1", "k2", largeText)));
+
+        // Full overwrite
+        execute("UPDATE %s SET m = ? WHERE k = 0", map("k5", largeText, largeText2, "v6"));
+        flush();
+
+        assertRows(execute("SELECT m FROM %s WHERE k = 0"),
+                   row(map("k5", largeText, largeText2, "v6")));
+
+        execute("DELETE m FROM %s WHERE k = 0");
+
+        assertRows(execute("SELECT m FROM %s WHERE k = 0"), row((Object) null));
+
+        execute("INSERT INTO %s(k, m) VALUES (0, {'" + largeText + "' : 'v1', 'k2' : '" + largeText + "'})");
+        flush();
+
+        assertRows(execute("SELECT m FROM %s WHERE k = 0"),
+                   row(map(largeText, "v1", "k2", largeText)));
+    }
+
+    @Test
+    public void testSetsWithElementsBiggerThan64K() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, s frozen<set<text>>)");
+
+        byte[] bytes = new byte[FBUtilities.MAX_UNSIGNED_SHORT + 10];
+        Arrays.fill(bytes, (byte) 1);
+        String largeText = new String(bytes);
+
+        execute("INSERT INTO %s(k, s) VALUES (0, ?)", set(largeText, "v1", "v2"));
+        flush();
+
+        assertRows(execute("SELECT s FROM %s WHERE k = 0"), row(set(largeText, "v1", "v2")));
+
+        // Full overwrite
+        execute("UPDATE %s SET s = ? WHERE k = 0", set(largeText, "v3"));
+        flush();
+
+        assertRows(execute("SELECT s FROM %s WHERE k = 0"), row(set(largeText, "v3")));
+
+        execute("DELETE s FROM %s WHERE k = 0");
+
+        assertRows(execute("SELECT s FROM %s WHERE k = 0"), row((Object) null));
+
+        execute("INSERT INTO %s(k, s) VALUES (0, {'" + largeText + "', 'v1', 'v2'})");
+        flush();
+
+        assertRows(execute("SELECT s FROM %s WHERE k = 0"), row(set(largeText, "v1", "v2")));
     }
 }

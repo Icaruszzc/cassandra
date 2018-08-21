@@ -23,6 +23,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.CharsetEncoder;
 import java.nio.charset.CharacterCodingException;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Json;
 
@@ -31,15 +32,16 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.AsciiSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class AsciiType extends AbstractType<String>
 {
     public static final AsciiType instance = new AsciiType();
 
-    AsciiType() {} // singleton
+    AsciiType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
-    private final ThreadLocal<CharsetEncoder> encoder = new ThreadLocal<CharsetEncoder>()
+    private final FastThreadLocal<CharsetEncoder> encoder = new FastThreadLocal<CharsetEncoder>()
     {
         @Override
         protected CharsetEncoder initialValue()
@@ -47,11 +49,6 @@ public class AsciiType extends AbstractType<String>
             return Charset.forName("US-ASCII").newEncoder();
         }
     };
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
-    {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
 
     public ByteBuffer fromString(String source)
     {
@@ -84,11 +81,11 @@ public class AsciiType extends AbstractType<String>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         try
         {
-            return '"' + new String(Json.JSON_STRING_ENCODER.quoteAsString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII")))) + '"';
+            return '"' + Json.quoteAsJsonString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII"))) + '"';
         }
         catch (CharacterCodingException exc)
         {
@@ -104,10 +101,5 @@ public class AsciiType extends AbstractType<String>
     public TypeSerializer<String> getSerializer()
     {
         return AsciiSerializer.instance;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return true;
     }
 }

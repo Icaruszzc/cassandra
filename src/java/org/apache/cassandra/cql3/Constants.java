@@ -23,13 +23,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.db.marshal.CounterColumnType;
-import org.apache.cassandra.db.marshal.LongType;
-import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -41,12 +38,38 @@ public abstract class Constants
 
     public enum Type
     {
-        STRING, INTEGER, UUID, FLOAT, DATE, TIME, BOOLEAN, HEX;
+        STRING, INTEGER, UUID, FLOAT, BOOLEAN, HEX, DURATION;
     }
+
+    private static class UnsetLiteral extends Term.Raw
+    {
+        public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
+        {
+            return UNSET_VALUE;
+        }
+
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
+        {
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+        }
+
+        public String getText()
+        {
+            return "";
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
+        }
+    }
+
+    // We don't have "unset" literal in the syntax, but it's used implicitely for JSON "DEFAULT UNSET" option
+    public static final UnsetLiteral UNSET_LITERAL = new UnsetLiteral();
 
     public static final Value UNSET_VALUE = new Value(ByteBufferUtil.UNSET_BYTE_BUFFER);
 
-    public static final Term.Raw NULL_LITERAL = new Term.Raw()
+    private static class NullLiteral extends Term.Raw
     {
         public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
@@ -63,12 +86,18 @@ public abstract class Constants
                  : AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
         }
 
-        @Override
-        public String toString()
+        public String getText()
         {
-            return "null";
+            return "NULL";
         }
-    };
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
+        }
+    }
+
+    public static final NullLiteral NULL_LITERAL = new NullLiteral();
 
     public static final Term.Terminal NULL_VALUE = new Value(null)
     {
@@ -86,7 +115,7 @@ public abstract class Constants
         }
     };
 
-    public static class Literal implements Term.Raw
+    public static class Literal extends Term.Raw
     {
         private final Type type;
         private final String text;
@@ -128,6 +157,11 @@ public abstract class Constants
             return new Literal(Type.HEX, text);
         }
 
+        public static Literal duration(String text)
+        {
+            return new Literal(Type.DURATION, text);
+        }
+
         public Value prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
             if (!testAssignment(keyspace, receiver).isAssignable())
@@ -142,9 +176,12 @@ public abstract class Constants
                 validator = ((ReversedType<?>) validator).baseType;
             try
             {
-                // BytesType doesn't want it's input prefixed by '0x'.
-                if (type == Type.HEX && validator instanceof BytesType)
-                    return validator.fromString(text.substring(2));
+                if (type == Type.HEX)
+                    // Note that validator could be BytesType, but it could also be a custom type, so
+                    // we hardcode BytesType (rather than using 'validator') in the call below.
+                    // Further note that BytesType doesn't want it's input prefixed by '0x', hence the substring.
+                    return BytesType.instance.fromString(text.substring(2));
+
                 if (validator instanceof CounterColumnType)
                     return LongType.instance.fromString(text);
                 return validator.fromString(text);
@@ -155,15 +192,11 @@ public abstract class Constants
             }
         }
 
-        public String getRawText()
-        {
-            return text;
-        }
-
+        @Override
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             CQL3Type receiverType = receiver.type.asCQL3Type();
-            if (receiverType.isCollection())
+            if (receiverType.isCollection() || receiverType.isUDT())
                 return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
 
             if (!(receiverType instanceof CQL3Type.Native))
@@ -194,9 +227,11 @@ public abstract class Constants
                         case DATE:
                         case DECIMAL:
                         case DOUBLE:
+                        case DURATION:
                         case FLOAT:
                         case INT:
                         case SMALLINT:
+                        case TIME:
                         case TIMESTAMP:
                         case TINYINT:
                         case VARINT:
@@ -234,12 +269,33 @@ public abstract class Constants
                             return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
                     break;
+                case DURATION:
+                    switch (nt)
+                    {
+                        case DURATION:
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+                    }
+                    break;
             }
             return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
         }
 
-        @Override
-        public String toString()
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            // Most constant are valid for more than one type (the extreme example being integer constants, which can
+            // be use for any numerical type, including date, time, ...) so they don't have an exact type. And in fact,
+            // for good or bad, any literal is valid for custom types, so we can never claim an exact type.
+            // But really, the reason it's fine to return null here is that getExactTypeIfKnown is only used to
+            // implement testAssignment() in Selectable and that method is overriden above.
+            return null;
+        }
+
+        public String getRawText()
+        {
+            return text;
+        }
+
+        public String getText()
         {
             return type == Type.STRING ? String.format("'%s'", text) : text;
         }
@@ -257,7 +313,7 @@ public abstract class Constants
             this.bytes = bytes;
         }
 
-        public ByteBuffer get(int protocolVersion)
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             return bytes;
         }
@@ -277,7 +333,8 @@ public abstract class Constants
 
     public static class Marker extends AbstractMarker
     {
-        protected Marker(int bindIndex, ColumnSpecification receiver)
+        // Constructor is public only for the SuperColumn tables support
+        public Marker(int bindIndex, ColumnSpecification receiver)
         {
             super(bindIndex, receiver);
             assert !receiver.type.isCollection();

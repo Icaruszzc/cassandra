@@ -20,17 +20,16 @@ package org.apache.cassandra.schema;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.*;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Sets;
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.commons.lang3.builder.HashCodeBuilder;
-import org.slf4j.LoggerFactory;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -48,31 +47,31 @@ public final class CompressionParams
 
     private static volatile boolean hasLoggedSsTableCompressionWarning;
     private static volatile boolean hasLoggedChunkLengthWarning;
+    private static volatile boolean hasLoggedCrcCheckChanceWarning;
 
     public static final int DEFAULT_CHUNK_LENGTH = 65536;
-    public static final double DEFAULT_CRC_CHECK_CHANCE = 1.0;
     public static final IVersionedSerializer<CompressionParams> serializer = new Serializer();
 
     public static final String CLASS = "class";
     public static final String CHUNK_LENGTH_IN_KB = "chunk_length_in_kb";
     public static final String ENABLED = "enabled";
 
-    public static final CompressionParams DEFAULT = new CompressionParams(LZ4Compressor.instance,
+    public static final CompressionParams DEFAULT = new CompressionParams(LZ4Compressor.create(Collections.<String, String>emptyMap()),
                                                                           DEFAULT_CHUNK_LENGTH,
                                                                           Collections.emptyMap());
 
+    private static final String CRC_CHECK_CHANCE_WARNING = "The option crc_check_chance was deprecated as a compression option. " +
+                                                           "You should specify it as a top-level table option instead";
+
     @Deprecated public static final String SSTABLE_COMPRESSION = "sstable_compression";
     @Deprecated public static final String CHUNK_LENGTH_KB = "chunk_length_kb";
-
-    public static final String CRC_CHECK_CHANCE = "crc_check_chance";
-
-    public static final Set<String> GLOBAL_OPTIONS = ImmutableSet.of(CRC_CHECK_CHANCE);
+    @Deprecated public static final String CRC_CHECK_CHANCE = "crc_check_chance";
 
     private final ICompressor sstableCompressor;
     private final Integer chunkLength;
-    private volatile double crcCheckChance;
-    private final ImmutableMap<String, String> otherOptions; // Unrecognized options, can be use by the compressor
-    private CFMetaData liveMetadata;
+    private final ImmutableMap<String, String> otherOptions; // Unrecognized options, can be used by the compressor
+
+    private volatile double crcCheckChance = 1.0;
 
     public static CompressionParams fromMap(Map<String, String> opts)
     {
@@ -140,7 +139,7 @@ public final class CompressionParams
 
     public static CompressionParams lz4(Integer chunkLength)
     {
-        return new CompressionParams(LZ4Compressor.instance, chunkLength, Collections.emptyMap());
+        return new CompressionParams(LZ4Compressor.create(Collections.emptyMap()), chunkLength, Collections.emptyMap());
     }
 
     public CompressionParams(String sstableCompressorClass, Integer chunkLength, Map<String, String> otherOptions) throws ConfigurationException
@@ -153,30 +152,11 @@ public final class CompressionParams
         this.sstableCompressor = sstableCompressor;
         this.chunkLength = chunkLength;
         this.otherOptions = ImmutableMap.copyOf(otherOptions);
-        String chance = otherOptions.get(CRC_CHECK_CHANCE);
-        this.crcCheckChance = (chance == null) ? DEFAULT_CRC_CHECK_CHANCE : parseCrcCheckChance(chance);
     }
 
     public CompressionParams copy()
     {
         return new CompressionParams(sstableCompressor, chunkLength, otherOptions);
-    }
-
-    public void setLiveMetadata(final CFMetaData liveMetadata)
-    {
-        if (liveMetadata == null)
-            return;
-
-        this.liveMetadata = liveMetadata;
-    }
-
-    public void setCrcCheckChance(double crcCheckChance) throws ConfigurationException
-    {
-        validateCrcCheckChance(crcCheckChance);
-        this.crcCheckChance = crcCheckChance;
-
-        if (liveMetadata != null && this != liveMetadata.params.compression)
-            liveMetadata.params.compression.setCrcCheckChance(crcCheckChance);
     }
 
     /**
@@ -200,31 +180,6 @@ public final class CompressionParams
     public ImmutableMap<String, String> getOtherOptions()
     {
         return otherOptions;
-    }
-
-    public double getCrcCheckChance()
-    {
-        return liveMetadata == null ? this.crcCheckChance : liveMetadata.params.compression.crcCheckChance;
-    }
-
-    private static double parseCrcCheckChance(String crcCheckChance) throws ConfigurationException
-    {
-        try
-        {
-            double chance = Double.parseDouble(crcCheckChance);
-            validateCrcCheckChance(chance);
-            return chance;
-        }
-        catch (NumberFormatException e)
-        {
-            throw new ConfigurationException("crc_check_chance should be a double");
-        }
-    }
-
-    private static void validateCrcCheckChance(double crcCheckChance) throws ConfigurationException
-    {
-        if (crcCheckChance < 0.0d || crcCheckChance > 1.0d)
-            throw new ConfigurationException("crc_check_chance should be between 0.0 and 1.0");
     }
 
     public int chunkLength()
@@ -257,14 +212,23 @@ public final class CompressionParams
             return null;
         }
 
+        if (compressionOptions.containsKey(CRC_CHECK_CHANCE))
+        {
+            if (!hasLoggedCrcCheckChanceWarning)
+            {
+                logger.warn(CRC_CHECK_CHANCE_WARNING);
+                hasLoggedCrcCheckChanceWarning = true;
+            }
+            compressionOptions.remove(CRC_CHECK_CHANCE);
+        }
+
         try
         {
             Method method = compressorClass.getMethod("create", Map.class);
             ICompressor compressor = (ICompressor)method.invoke(null, compressionOptions);
             // Check for unknown options
-            AbstractSet<String> supportedOpts = Sets.union(compressor.supportedOptions(), GLOBAL_OPTIONS);
             for (String provided : compressionOptions.keySet())
-                if (!supportedOpts.contains(provided))
+                if (!compressor.supportedOptions().contains(provided))
                     throw new ConfigurationException("Unknown compression options " + provided);
             return compressor;
         }
@@ -301,14 +265,15 @@ public final class CompressionParams
         }
     }
 
-    public static ICompressor createCompressor(ParameterizedClass compression) throws ConfigurationException {
+    public static ICompressor createCompressor(ParameterizedClass compression) throws ConfigurationException
+    {
         return createCompressor(parseCompressorClass(compression.class_name), copyOptions(compression.parameters));
     }
 
     private static Map<String, String> copyOptions(Map<? extends CharSequence, ? extends CharSequence> co)
     {
         if (co == null || co.isEmpty())
-            return Collections.<String, String>emptyMap();
+            return Collections.emptyMap();
 
         Map<String, String> compressionOptions = new HashMap<>();
         for (Map.Entry<? extends CharSequence, ? extends CharSequence> entry : co.entrySet())
@@ -318,7 +283,7 @@ public final class CompressionParams
 
     /**
      * Parse the chunk length (in KB) and returns it as bytes.
-     * 
+     *
      * @param chLengthKB the length of the chunk to parse
      * @return the chunk length in bytes
      * @throws ConfigurationException if the chunk size is too large
@@ -363,12 +328,12 @@ public final class CompressionParams
 
         if (options.containsKey(CHUNK_LENGTH_KB))
         {
-            if (options.containsKey(CHUNK_LENGTH_KB) && !hasLoggedChunkLengthWarning)
+            if (!hasLoggedChunkLengthWarning)
             {
                 hasLoggedChunkLengthWarning = true;
-                logger.warn(format("The %s option has been deprecated. You should use %s instead",
+                logger.warn("The {} option has been deprecated. You should use {} instead",
                                    CHUNK_LENGTH_KB,
-                                   CHUNK_LENGTH_IN_KB));
+                                   CHUNK_LENGTH_IN_KB);
             }
 
             return parseChunkLength(options.remove(CHUNK_LENGTH_KB));
@@ -415,9 +380,9 @@ public final class CompressionParams
         if (options.containsKey(SSTABLE_COMPRESSION) && !hasLoggedSsTableCompressionWarning)
         {
             hasLoggedSsTableCompressionWarning = true;
-            logger.warn(format("The %s option has been deprecated. You should use %s instead",
+            logger.warn("The {} option has been deprecated. You should use {} instead",
                                SSTABLE_COMPRESSION,
-                               CLASS));
+                               CLASS);
         }
 
         return options.remove(SSTABLE_COMPRESSION);
@@ -474,8 +439,6 @@ public final class CompressionParams
                 c >>= 1;
             }
         }
-
-        validateCrcCheckChance(crcCheckChance);
     }
 
     public Map<String, String> asMap()
@@ -493,6 +456,16 @@ public final class CompressionParams
     public String chunkLengthInKB()
     {
         return String.valueOf(chunkLength() / 1024);
+    }
+
+    public void setCrcCheckChance(double crcCheckChance)
+    {
+        this.crcCheckChance = crcCheckChance;
+    }
+
+    public double getCrcCheckChance()
+    {
+        return crcCheckChance;
     }
 
     @Override

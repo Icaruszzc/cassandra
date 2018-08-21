@@ -19,9 +19,11 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
+import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.serializers.EmptySerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -34,9 +36,9 @@ public class EmptyType extends AbstractType<Void>
 {
     public static final EmptyType instance = new EmptyType();
 
-    private EmptyType() {} // singleton
+    private EmptyType() {super(ComparisonType.CUSTOM);} // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return 0;
     }
@@ -63,6 +65,18 @@ public class EmptyType extends AbstractType<Void>
             throw new MarshalException(String.format("'%s' is not empty", parsed));
 
         return new Constants.Value(ByteBufferUtil.EMPTY_BYTE_BUFFER);
+    }
+
+    @Override
+    public CQL3Type asCQL3Type()
+    {
+        return CQL3Type.Native.EMPTY;
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return "\"\"";
     }
 
     public TypeSerializer<Void> getSerializer()

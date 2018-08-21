@@ -21,18 +21,20 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import com.google.common.collect.Maps;
-
 import org.apache.cassandra.db.TypeSizes;
-import org.apache.cassandra.db.commitlog.ReplayPosition;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.StreamingHistogram;
+
+import static org.apache.cassandra.io.sstable.metadata.StatsMetadata.commitLogPositionSetSerializer;
 
 /**
  * Serializer for SSTable from legacy versions
@@ -44,7 +46,7 @@ public class LegacyMetadataSerializer extends MetadataSerializer
      * Legacy serialization is only used for SSTable level reset.
      */
     @Override
-    public void serialize(Map<MetadataType, MetadataComponent> components, DataOutputPlus out) throws IOException
+    public void serialize(Map<MetadataType, MetadataComponent> components, DataOutputPlus out, Version version) throws IOException
     {
         ValidationMetadata validation = (ValidationMetadata) components.get(MetadataType.VALIDATION);
         StatsMetadata stats = (StatsMetadata) components.get(MetadataType.STATS);
@@ -54,7 +56,7 @@ public class LegacyMetadataSerializer extends MetadataSerializer
 
         EstimatedHistogram.serializer.serialize(stats.estimatedPartitionSize, out);
         EstimatedHistogram.serializer.serialize(stats.estimatedColumnCount, out);
-        ReplayPosition.serializer.serialize(stats.replayPosition, out);
+        CommitLogPosition.serializer.serialize(stats.commitLogIntervals.upperBound().orElse(CommitLogPosition.NONE), out);
         out.writeLong(stats.minTimestamp);
         out.writeLong(stats.maxTimestamp);
         out.writeInt(stats.maxLocalDeletionTime);
@@ -70,6 +72,10 @@ public class LegacyMetadataSerializer extends MetadataSerializer
         out.writeInt(stats.maxClusteringValues.size());
         for (ByteBuffer value : stats.maxClusteringValues)
             ByteBufferUtil.writeWithShortLength(value, out);
+        if (version.hasCommitLogLowerBound())
+            CommitLogPosition.serializer.serialize(stats.commitLogIntervals.lowerBound().orElse(CommitLogPosition.NONE), out);
+        if (version.hasCommitLogIntervals())
+            commitLogPositionSetSerializer.serialize(stats.commitLogIntervals, out);
     }
 
     /**
@@ -78,7 +84,7 @@ public class LegacyMetadataSerializer extends MetadataSerializer
     @Override
     public Map<MetadataType, MetadataComponent> deserialize(Descriptor descriptor, EnumSet<MetadataType> types) throws IOException
     {
-        Map<MetadataType, MetadataComponent> components = Maps.newHashMap();
+        Map<MetadataType, MetadataComponent> components = new EnumMap<>(MetadataType.class);
 
         File statsFile = new File(descriptor.filenameFor(Component.STATS));
         if (!statsFile.exists() && types.contains(MetadataType.STATS))
@@ -91,7 +97,8 @@ public class LegacyMetadataSerializer extends MetadataSerializer
             {
                 EstimatedHistogram partitionSizes = EstimatedHistogram.serializer.deserialize(in);
                 EstimatedHistogram columnCounts = EstimatedHistogram.serializer.deserialize(in);
-                ReplayPosition replayPosition = ReplayPosition.serializer.deserialize(in);
+                CommitLogPosition commitLogLowerBound = CommitLogPosition.NONE;
+                CommitLogPosition commitLogUpperBound = CommitLogPosition.serializer.deserialize(in);
                 long minTimestamp = in.readLong();
                 long maxTimestamp = in.readLong();
                 int maxLocalDeletionTime = in.readInt();
@@ -115,6 +122,14 @@ public class LegacyMetadataSerializer extends MetadataSerializer
                 for (int i = 0; i < colCount; i++)
                     maxColumnNames.add(ByteBufferUtil.readWithShortLength(in));
 
+                if (descriptor.version.hasCommitLogLowerBound())
+                    commitLogLowerBound = CommitLogPosition.serializer.deserialize(in);
+                IntervalSet<CommitLogPosition> commitLogIntervals;
+                if (descriptor.version.hasCommitLogIntervals())
+                    commitLogIntervals = commitLogPositionSetSerializer.deserialize(in);
+                else
+                    commitLogIntervals = new IntervalSet<>(commitLogLowerBound, commitLogUpperBound);
+
                 if (types.contains(MetadataType.VALIDATION))
                     components.put(MetadataType.VALIDATION,
                                    new ValidationMetadata(partitioner, bloomFilterFPChance));
@@ -122,7 +137,7 @@ public class LegacyMetadataSerializer extends MetadataSerializer
                     components.put(MetadataType.STATS,
                                    new StatsMetadata(partitionSizes,
                                                      columnCounts,
-                                                     replayPosition,
+                                                     commitLogIntervals,
                                                      minTimestamp,
                                                      maxTimestamp,
                                                      Integer.MAX_VALUE,

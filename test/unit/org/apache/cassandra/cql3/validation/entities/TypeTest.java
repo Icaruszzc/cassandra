@@ -27,6 +27,16 @@ import static org.junit.Assert.fail;
 public class TypeTest extends CQLTester
 {
     @Test
+    public void testNonExistingOnes() throws Throwable
+    {
+        assertInvalidMessage("No user type named", "DROP TYPE " + KEYSPACE + ".type_does_not_exist");
+        assertInvalidMessage("Cannot drop type in unknown keyspace", "DROP TYPE keyspace_does_not_exist.type_does_not_exist");
+
+        execute("DROP TYPE IF EXISTS " + KEYSPACE + ".type_does_not_exist");
+        execute("DROP TYPE IF EXISTS keyspace_does_not_exist.type_does_not_exist");
+    }
+
+    @Test
     public void testNowToUUIDCompatibility() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b uuid, PRIMARY KEY (a, b))");
@@ -56,37 +66,5 @@ public class TypeTest extends CQLTester
         execute("INSERT INTO %s (a, b) VALUES (0, now())");
         UntypedResultSet results = execute("SELECT * FROM %s WHERE a=0 AND b < now()");
         assertEquals(1, results.size());
-    }
-
-    @Test
-    // tests CASSANDRA-7797
-    public void testAlterReversedColumn() throws Throwable
-    {
-        createTable("CREATE TABLE IF NOT EXISTS %s (a int, b 'org.apache.cassandra.db.marshal.DateType', PRIMARY KEY (a, b)) WITH CLUSTERING ORDER BY (b DESC)");
-        alterTable("ALTER TABLE %s ALTER b TYPE 'org.apache.cassandra.db.marshal.ReversedType(org.apache.cassandra.db.marshal.TimestampType)'");
-    }
-
-    @Test
-    public void testIncompatibleReversedTypes() throws Throwable
-    {
-        createTable("CREATE TABLE IF NOT EXISTS %s (a int, b 'org.apache.cassandra.db.marshal.DateType', PRIMARY KEY (a, b)) WITH CLUSTERING ORDER BY (b DESC)");
-        try
-        {
-            alterTable("ALTER TABLE %s ALTER b TYPE 'org.apache.cassandra.db.marshal.ReversedType(org.apache.cassandra.db.marshal.TimeUUIDType)'");
-            fail("Expected error for ALTER statement");
-        }
-        catch (RuntimeException e) { }
-    }
-
-    @Test
-    public void testReversedAndNonReversed() throws Throwable
-    {
-        createTable("CREATE TABLE IF NOT EXISTS %s (a int, b 'org.apache.cassandra.db.marshal.DateType', PRIMARY KEY (a, b))");
-        try
-        {
-            alterTable("ALTER TABLE %s ALTER b TYPE 'org.apache.cassandra.db.marshal.ReversedType(org.apache.cassandra.db.marshal.DateType)'");
-            fail("Expected error for ALTER statement");
-        }
-        catch (RuntimeException e) { }
     }
 }

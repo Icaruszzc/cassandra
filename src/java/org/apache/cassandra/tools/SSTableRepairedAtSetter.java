@@ -26,6 +26,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.service.ActiveRepairService;
@@ -48,9 +49,6 @@ public class SSTableRepairedAtSetter
      */
     public static void main(final String[] args) throws IOException
     {
-        // Necessary since BufferPool used in RandomAccessReader needs to access DatabaseDescriptor
-        Config.setClientMode(true);
-
         PrintStream out = System.out;
         if (args.length == 0)
         {
@@ -66,6 +64,8 @@ public class SSTableRepairedAtSetter
             out.println("Usage: sstablerepairedset --really-set [--is-repaired | --is-unrepaired] [-f <sstable-list> | <sstables>]");
             System.exit(1);
         }
+
+        Util.initDatabaseDescriptor();
 
         boolean setIsRepaired = args[1].equals("--is-repaired");
 
