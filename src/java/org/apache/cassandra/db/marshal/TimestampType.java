@@ -28,6 +28,7 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TimestampSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -43,14 +44,14 @@ public class TimestampType extends AbstractType<Date>
 
     public static final TimestampType instance = new TimestampType();
 
-    private TimestampType() {} // singleton
+    private TimestampType() {super(ComparisonType.CUSTOM);} // singleton
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return LongType.compareLongs(o1, o2);
     }
@@ -87,10 +88,15 @@ public class TimestampType extends AbstractType<Date>
         }
     }
 
-    @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    private String toString(Date date)
     {
-        return '"' + TimestampSerializer.TO_JSON_FORMAT.format(TimestampSerializer.instance.deserialize(buffer)) + '"';
+        return date != null ? TimestampSerializer.getJsonDateFormatter().format(date) : "";
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return '"' + toString(TimestampSerializer.instance.deserialize(buffer)) + '"';
     }
 
     @Override

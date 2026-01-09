@@ -17,11 +17,23 @@
  */
 package org.apache.cassandra.concurrent;
 
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.utils.ExecutorUtils;
+
 /**
  * Centralized location for shared executors
  */
 public class ScheduledExecutors
 {
+    /**
+     * This pool is used for periodic fast (sub-microsecond) tasks.
+     */
+    public static final DebuggableScheduledThreadPoolExecutor scheduledFastTasks = new DebuggableScheduledThreadPoolExecutor("ScheduledFastTasks");
+
     /**
      * This pool is used for periodic short (sub-second) tasks.
      */
@@ -31,13 +43,15 @@ public class ScheduledExecutors
      * This executor is used for tasks that can have longer execution times, and usually are non periodic.
      */
     public static final DebuggableScheduledThreadPoolExecutor nonPeriodicTasks = new DebuggableScheduledThreadPoolExecutor("NonPeriodicTasks");
-    static
-    {
-        nonPeriodicTasks.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-    }
 
     /**
      * This executor is used for tasks that do not need to be waited for on shutdown/drain.
      */
     public static final DebuggableScheduledThreadPoolExecutor optionalTasks = new DebuggableScheduledThreadPoolExecutor("OptionalTasks");
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        ExecutorUtils.shutdownNowAndWait(timeout, unit, scheduledFastTasks, scheduledTasks, nonPeriodicTasks, optionalTasks);
+    }
 }

@@ -23,14 +23,17 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.service.MigrationListener;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Refs;
 
@@ -57,26 +60,25 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
 
     public void run()
     {
-        if (StorageService.instance.isStarting())
+        TokenMetadata metadata = StorageService.instance.getTokenMetadata().cloneOnlyTokenMap();
+        if (!metadata.isMember(FBUtilities.getBroadcastAddress()))
         {
-            logger.debug("Node has not yet joined; not recording size estimates");
+            logger.debug("Node is not part of the ring; not recording size estimates");
             return;
         }
 
-        logger.debug("Recording size estimates");
+        logger.trace("Recording size estimates");
 
-        // find primary token ranges for the local node.
-        Collection<Token> localTokens = StorageService.instance.getLocalTokens();
-        Collection<Range<Token>> localRanges = StorageService.instance.getTokenMetadata().getPrimaryRangesFor(localTokens);
-
-        for (Keyspace keyspace : Keyspace.nonSystem())
+        for (Keyspace keyspace : Keyspace.nonLocalStrategy())
         {
+            Collection<Range<Token>> localRanges = StorageService.instance.getPrimaryRangesForEndpoint(keyspace.getName(),
+                    FBUtilities.getBroadcastAddress());
             for (ColumnFamilyStore table : keyspace.getColumnFamilyStores())
             {
                 long start = System.nanoTime();
                 recordSizeEstimates(table, localRanges);
                 long passed = System.nanoTime() - start;
-                logger.debug("Spent {} milliseconds on estimating {}.{} size",
+                logger.trace("Spent {} milliseconds on estimating {}.{} size",
                              TimeUnit.NANOSECONDS.toMillis(passed),
                              table.metadata.ksName,
                              table.metadata.cfName);
@@ -87,34 +89,39 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
     @SuppressWarnings("resource")
     private void recordSizeEstimates(ColumnFamilyStore table, Collection<Range<Token>> localRanges)
     {
-        List<Range<Token>> unwrappedRanges = Range.normalize(localRanges);
         // for each local primary range, estimate (crudely) mean partition size and partitions count.
         Map<Range<Token>, Pair<Long, Long>> estimates = new HashMap<>(localRanges.size());
-        for (Range<Token> range : unwrappedRanges)
+        for (Range<Token> localRange : localRanges)
         {
-            // filter sstables that have partitions in this range.
-            Refs<SSTableReader> refs = null;
-            long partitionsCount, meanPartitionSize;
-
-            try
+            for (Range<Token> unwrappedRange : localRange.unwrap())
             {
-                while (refs == null)
+                // filter sstables that have partitions in this range.
+                Refs<SSTableReader> refs = null;
+                long partitionsCount, meanPartitionSize;
+
+                try
                 {
-                    ColumnFamilyStore.ViewFragment view = table.select(View.select(SSTableSet.CANONICAL, Range.makeRowRange(range)));
-                    refs = Refs.tryRef(view.sstables);
+                    while (refs == null)
+                    {
+                        Iterable<SSTableReader> sstables = table.getTracker().getView().select(SSTableSet.CANONICAL);
+                        SSTableIntervalTree tree = SSTableIntervalTree.build(sstables);
+                        Range<PartitionPosition> r = Range.makeRowRange(unwrappedRange);
+                        Iterable<SSTableReader> canonicalSSTables = View.sstablesInBounds(r.left, r.right, tree);
+                        refs = Refs.tryRef(canonicalSSTables);
+                    }
+
+                    // calculate the estimates.
+                    partitionsCount = estimatePartitionsCount(refs, unwrappedRange);
+                    meanPartitionSize = estimateMeanPartitionSize(refs);
+                }
+                finally
+                {
+                    if (refs != null)
+                        refs.release();
                 }
 
-                // calculate the estimates.
-                partitionsCount = estimatePartitionsCount(refs, range);
-                meanPartitionSize = estimateMeanPartitionSize(refs);
+                estimates.put(unwrappedRange, Pair.create(partitionsCount, meanPartitionSize));
             }
-            finally
-            {
-                if (refs != null)
-                    refs.release();
-            }
-
-            estimates.put(range, Pair.create(partitionsCount, meanPartitionSize));
         }
 
         // atomically update the estimates.

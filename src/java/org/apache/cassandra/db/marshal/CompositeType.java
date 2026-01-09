@@ -19,18 +19,18 @@ package org.apache.cassandra.db.marshal;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import com.google.common.collect.ImmutableList;
 
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.serializers.MarshalException;
@@ -68,7 +68,7 @@ public class CompositeType extends AbstractCompositeType
     public final List<AbstractType<?>> types;
 
     // interning instances
-    private static final Map<List<AbstractType<?>>, CompositeType> instances = new HashMap<List<AbstractType<?>>, CompositeType>();
+    private static final ConcurrentMap<List<AbstractType<?>>, CompositeType> instances = new ConcurrentHashMap<List<AbstractType<?>>, CompositeType>();
 
     public static CompositeType getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
     {
@@ -98,7 +98,7 @@ public class CompositeType extends AbstractCompositeType
         return true;
     }
 
-    public static synchronized CompositeType getInstance(List<AbstractType<?>> types)
+    public static CompositeType getInstance(List<AbstractType<?>> types)
     {
         assert types != null && !types.isEmpty();
 
@@ -106,7 +106,11 @@ public class CompositeType extends AbstractCompositeType
         if (ct == null)
         {
             ct = new CompositeType(types);
-            instances.put(types, ct);
+            CompositeType previous = instances.putIfAbsent(types, ct);
+            if (previous != null)
+            {
+                ct = previous;
+            }
         }
         return ct;
     }
@@ -200,6 +204,11 @@ public class CompositeType extends AbstractCompositeType
         return l;
     }
 
+    public static byte lastEOC(ByteBuffer name)
+    {
+        return name.get(name.limit() - 1);
+    }
+
     // Extract component idx from bb. Return null if there is not enough component.
     public static ByteBuffer extractComponent(ByteBuffer bb, int idx)
     {
@@ -216,32 +225,6 @@ public class CompositeType extends AbstractCompositeType
             ++i;
         }
         return null;
-    }
-
-    public static class CompositeComponent
-    {
-        public ByteBuffer value;
-        public byte eoc;
-
-        public CompositeComponent(ByteBuffer value, byte eoc)
-        {
-            this.value = value;
-            this.eoc = eoc;
-        }
-    }
-
-    public static List<CompositeComponent> deconstruct(ByteBuffer bytes)
-    {
-        List<CompositeComponent> list = new ArrayList<>();
-        ByteBuffer bb = bytes.duplicate();
-        readStatic(bb);
-        while (bb.remaining() > 0)
-        {
-            ByteBuffer value = ByteBufferUtil.readBytesWithShortLength(bb);
-            byte eoc = bb.get();
-            list.add(new CompositeComponent(value, eoc));
-        }
-        return list;
     }
 
     // Extract CQL3 column name from the full column name.
@@ -356,6 +339,11 @@ public class CompositeType extends AbstractCompositeType
         return new Builder(this);
     }
 
+    public Builder builder(boolean isStatic)
+    {
+        return new Builder(this, isStatic);
+    }
+
     public static ByteBuffer build(ByteBuffer... buffers)
     {
         return build(false, buffers);
@@ -375,7 +363,9 @@ public class CompositeType extends AbstractCompositeType
         for (ByteBuffer bb : buffers)
         {
             ByteBufferUtil.writeShortLength(out, bb.remaining());
-            out.put(bb.duplicate());
+            int toCopy = bb.remaining();
+            ByteBufferUtil.arrayCopy(bb, bb.position(), out, out.position(), toCopy);
+            out.position(out.position() + toCopy);
             out.put((byte) 0);
         }
         out.flip();
@@ -393,12 +383,12 @@ public class CompositeType extends AbstractCompositeType
 
         public Builder(CompositeType composite)
         {
-            this(composite, new ArrayList<ByteBuffer>(composite.types.size()), new byte[composite.types.size()], false);
+            this(composite, false);
         }
 
-        public static Builder staticBuilder(CompositeType composite)
+        public Builder(CompositeType composite, boolean isStatic)
         {
-            return new Builder(composite, new ArrayList<ByteBuffer>(composite.types.size()), new byte[composite.types.size()], true);
+            this(composite, new ArrayList<>(composite.types.size()), new byte[composite.types.size()], isStatic);
         }
 
         private Builder(CompositeType composite, List<ByteBuffer> components, byte[] endOfComponents, boolean isStatic)
@@ -415,7 +405,7 @@ public class CompositeType extends AbstractCompositeType
 
         private Builder(Builder b)
         {
-            this(b.composite, new ArrayList<ByteBuffer>(b.components), Arrays.copyOf(b.endOfComponents, b.endOfComponents.length), b.isStatic);
+            this(b.composite, new ArrayList<>(b.components), Arrays.copyOf(b.endOfComponents, b.endOfComponents.length), b.isStatic);
             this.serializedSize = b.serializedSize;
         }
 

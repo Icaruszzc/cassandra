@@ -17,98 +17,235 @@
  */
 package org.apache.cassandra.hints;
 
+import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.zip.CRC32;
 
-import org.apache.cassandra.io.util.AbstractDataInput;
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.utils.NativeLibrary;
+import org.apache.cassandra.utils.memory.BufferPool;
 
 /**
- * An {@link AbstractDataInput} wrapper that calctulates the CRC in place.
+ * A {@link RandomAccessReader} wrapper that calculates the CRC in place.
  *
  * Useful for {@link org.apache.cassandra.hints.HintsReader}, for example, where we must verify the CRC, yet don't want
- * to allocate an extra byte array just that purpose.
+ * to allocate an extra byte array just that purpose. The CRC can be embedded in the input stream and checked via checkCrc().
  *
- * In addition to calculating the CRC, allows to enforce a maximim known size. This is needed
+ * In addition to calculating the CRC, it allows to enforce a maximum known size. This is needed
  * so that {@link org.apache.cassandra.db.Mutation.MutationSerializer} doesn't blow up the heap when deserializing a
  * corrupted sequence by reading a huge corrupted length of bytes via
- * via {@link org.apache.cassandra.utils.ByteBufferUtil#readWithLength(java.io.DataInput)}.
+ * {@link org.apache.cassandra.utils.ByteBufferUtil#readWithLength(java.io.DataInput)}.
  */
-public final class ChecksummedDataInput extends AbstractDataInput
+public class ChecksummedDataInput extends RebufferingInputStream
 {
     private final CRC32 crc;
-    private final AbstractDataInput source;
-    private int limit;
+    private int crcPosition;
+    private boolean crcUpdateDisabled;
 
-    private ChecksummedDataInput(AbstractDataInput source)
+    private long limit;
+    private long limitMark;
+
+    protected long bufferOffset;
+    protected final ChannelProxy channel;
+
+    ChecksummedDataInput(ChannelProxy channel, BufferType bufferType)
     {
-        this.source = source;
+        super(BufferPool.get(RandomAccessReader.DEFAULT_BUFFER_SIZE, bufferType));
 
         crc = new CRC32();
-        limit = Integer.MAX_VALUE;
+        crcPosition = 0;
+        crcUpdateDisabled = false;
+        this.channel = channel;
+        bufferOffset = 0;
+        buffer.limit(0);
+
+        resetLimit();
     }
 
-    public static ChecksummedDataInput wrap(AbstractDataInput source)
+    ChecksummedDataInput(ChannelProxy channel)
     {
-        return new ChecksummedDataInput(source);
+        this(channel, BufferType.OFF_HEAP);
+    }
+
+    @SuppressWarnings("resource")
+    public static ChecksummedDataInput open(File file)
+    {
+        return new ChecksummedDataInput(new ChannelProxy(file));
+    }
+
+    public boolean isEOF()
+    {
+        return getPosition() == channel.size();
+    }
+
+    static class Position implements InputPosition
+    {
+        final long sourcePosition;
+
+        public Position(long sourcePosition)
+        {
+            super();
+            this.sourcePosition = sourcePosition;
+        }
+
+        @Override
+        public long subtract(InputPosition other)
+        {
+            return sourcePosition - ((Position)other).sourcePosition;
+        }
+    }
+
+    /**
+     * Return a seekable representation of the current position. For compressed files this is chunk position
+     * in file and offset within chunk.
+     */
+    public InputPosition getSeekPosition()
+    {
+        return new Position(getPosition());
+    }
+
+    public void seek(InputPosition pos)
+    {
+        updateCrc();
+        bufferOffset = ((Position) pos).sourcePosition;
+        buffer.position(0).limit(0);
     }
 
     public void resetCrc()
     {
         crc.reset();
+        crcPosition = buffer.position();
+    }
+
+    public void limit(long newLimit)
+    {
+        limitMark = getPosition();
+        limit = limitMark + newLimit;
+    }
+
+    /**
+     * Returns the exact position in the uncompressed view of the file.
+     */
+    protected long getPosition()
+    {
+        return bufferOffset + buffer.position();
+    }
+
+    /**
+     * Returns the position in the source file, which is different for getPosition() for compressed/encrypted files
+     * and may be imprecise.
+     */
+    protected long getSourcePosition()
+    {
+        return bufferOffset;
     }
 
     public void resetLimit()
     {
-        limit = Integer.MAX_VALUE;
+        limit = Long.MAX_VALUE;
+        limitMark = -1;
     }
 
-    public void limit(int newLimit)
+    public void checkLimit(int length) throws IOException
     {
-        limit = newLimit;
+        if (getPosition() + length > limit)
+            throw new IOException("Digest mismatch exception");
     }
 
-    public int bytesRemaining()
+    public long bytesPastLimit()
     {
-        return limit;
+        assert limitMark != -1;
+        return getPosition() - limitMark;
     }
 
-    public int getCrc()
+    public boolean checkCrc() throws IOException
     {
-        return (int) crc.getValue();
-    }
+        try
+        {
+            updateCrc();
 
-    public void seek(long position) throws IOException
-    {
-        source.seek(position);
-    }
-
-    public long getPosition()
-    {
-        return source.getPosition();
-    }
-
-    public long getPositionLimit()
-    {
-        return source.getPositionLimit();
-    }
-
-    public int read() throws IOException
-    {
-        int b = source.read();
-        crc.update(b);
-        limit--;
-        return b;
+            // we must disable crc updates in case we rebuffer
+            // when called source.readInt()
+            crcUpdateDisabled = true;
+            return ((int) crc.getValue()) == readInt();
+        }
+        finally
+        {
+            crcPosition = buffer.position();
+            crcUpdateDisabled = false;
+        }
     }
 
     @Override
-    public int read(byte[] buff, int offset, int length) throws IOException
+    public void readFully(byte[] b) throws IOException
     {
-        if (length > limit)
-            throw new IOException("Digest mismatch exception");
+        checkLimit(b.length);
+        super.readFully(b);
+    }
 
-        int copied = source.read(buff, offset, length);
-        crc.update(buff, offset, copied);
-        limit -= copied;
-        return copied;
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException
+    {
+        checkLimit(len);
+        return super.read(b, off, len);
+    }
+
+    @Override
+    protected void reBuffer()
+    {
+        Preconditions.checkState(buffer.remaining() == 0);
+        updateCrc();
+        bufferOffset += buffer.limit();
+
+        readBuffer();
+
+        crcPosition = buffer.position();
+    }
+
+    protected void readBuffer()
+    {
+        buffer.clear();
+        while ((channel.read(buffer, bufferOffset)) == 0) {}
+        buffer.flip();
+    }
+
+    public void tryUncacheRead()
+    {
+        NativeLibrary.trySkipCache(getChannel().getFileDescriptor(), 0, getSourcePosition(), getPath());
+    }
+
+    private void updateCrc()
+    {
+        if (crcPosition == buffer.position() || crcUpdateDisabled)
+            return;
+
+        assert crcPosition >= 0 && crcPosition < buffer.position();
+
+        ByteBuffer unprocessed = buffer.duplicate();
+        unprocessed.position(crcPosition)
+                   .limit(buffer.position());
+
+        crc.update(unprocessed);
+    }
+
+    @Override
+    public void close()
+    {
+        BufferPool.put(buffer);
+        channel.close();
+    }
+
+    protected String getPath()
+    {
+        return channel.filePath();
+    }
+
+    public ChannelProxy getChannel()
+    {
+        return channel;
     }
 }

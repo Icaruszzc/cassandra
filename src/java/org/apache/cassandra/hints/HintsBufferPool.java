@@ -17,32 +17,37 @@
  */
 package org.apache.cassandra.hints;
 
-import java.util.Queue;
+import java.io.Closeable;
+import java.io.IOException;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.net.MessagingService;
+import sun.nio.ch.DirectBuffer;
 
 /**
  * A primitive pool of {@link HintsBuffer} buffers. Under normal conditions should only hold two buffers - the currently
  * written to one, and a reserve buffer to switch to when the first one is beyond capacity.
  */
-final class HintsBufferPool
+final class HintsBufferPool implements Closeable
 {
     interface FlushCallback
     {
         void flush(HintsBuffer buffer, HintsBufferPool pool);
     }
 
+    static final int MAX_ALLOCATED_BUFFERS = Integer.getInteger(Config.PROPERTY_PREFIX + "MAX_HINT_BUFFERS", 3);
     private volatile HintsBuffer currentBuffer;
-    private final Queue<HintsBuffer> reserveBuffers;
+    private final BlockingQueue<HintsBuffer> reserveBuffers;
     private final int bufferSize;
     private final FlushCallback flushCallback;
+    private int allocatedBuffers = 0;
 
     HintsBufferPool(int bufferSize, FlushCallback flushCallback)
     {
-        reserveBuffers = new ConcurrentLinkedQueue<>();
-
+        reserveBuffers = new LinkedBlockingQueue<>();
         this.bufferSize = bufferSize;
         this.flushCallback = flushCallback;
     }
@@ -78,13 +83,10 @@ final class HintsBufferPool
         }
     }
 
-    boolean offer(HintsBuffer buffer)
+    void offer(HintsBuffer buffer)
     {
-        if (!reserveBuffers.isEmpty())
-            return false;
-
-        reserveBuffers.offer(buffer);
-        return true;
+        if (!reserveBuffers.offer(buffer))
+            throw new RuntimeException("Failed to store buffer");
     }
 
     // A wrapper to ensure a non-null currentBuffer value on the first call.
@@ -108,6 +110,18 @@ final class HintsBufferPool
             return false;
 
         HintsBuffer buffer = reserveBuffers.poll();
+        if (buffer == null && allocatedBuffers >= MAX_ALLOCATED_BUFFERS)
+        {
+            try
+            {
+                //This BlockingQueue.take is a target for byteman in HintsBufferPoolTest
+                buffer = reserveBuffers.take();
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
         currentBuffer = buffer == null ? createBuffer() : buffer;
 
         return true;
@@ -115,6 +129,12 @@ final class HintsBufferPool
 
     private HintsBuffer createBuffer()
     {
+        allocatedBuffers++;
         return HintsBuffer.create(bufferSize);
+    }
+
+    public void close()
+    {
+        currentBuffer.free();
     }
 }

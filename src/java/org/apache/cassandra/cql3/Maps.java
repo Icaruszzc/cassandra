@@ -21,20 +21,18 @@ import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-
-import com.google.common.collect.Iterables;
+import java.util.stream.Collectors;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
 /**
@@ -46,15 +44,30 @@ public abstract class Maps
 
     public static ColumnSpecification keySpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("key(" + column.name + ")", true), ((MapType)column.type).getKeysType());
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("key(" + column.name + ")", true), keysType(column.type));
     }
 
     public static ColumnSpecification valueSpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((MapType)column.type).getValuesType());
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), valuesType(column.type));
     }
 
-    public static class Literal implements Term.Raw
+    private static AbstractType<?> unwrap(AbstractType<?> type)
+    {
+        return type.isReversed() ? unwrap(((ReversedType<?>) type).baseType) : type;
+    }
+
+    private static AbstractType<?> keysType(AbstractType<?> type)
+    {
+        return ((MapType) unwrap(type)).getKeysType();
+    }
+
+    private static AbstractType<?> valuesType(AbstractType<?> type)
+    {
+        return ((MapType) unwrap(type)).getValuesType();
+    }
+
+    public static class Literal extends Term.Raw
     {
         public final List<Pair<Term.Raw, Term.Raw>> entries;
 
@@ -84,13 +97,15 @@ public abstract class Maps
 
                 values.put(k, v);
             }
-            DelayedValue value = new DelayedValue(((MapType)receiver.type).getKeysType(), values);
+            DelayedValue value = new DelayedValue(keysType(receiver.type), values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
         private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (!(receiver.type instanceof MapType))
+            AbstractType<?> type = unwrap(receiver.type);
+
+            if (!(type instanceof MapType))
                 throw new InvalidRequestException(String.format("Invalid map literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
 
             ColumnSpecification keySpec = Maps.keySpecOf(receiver);
@@ -130,37 +145,48 @@ public abstract class Maps
         }
 
         @Override
-        public String toString()
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
-            for (int i = 0; i < entries.size(); i++)
+            AbstractType<?> keyType = null;
+            AbstractType<?> valueType = null;
+            for (Pair<Term.Raw, Term.Raw> entry : entries)
             {
-                if (i > 0) sb.append(", ");
-                sb.append(entries.get(i).left).append(":").append(entries.get(i).right);
+                if (keyType == null)
+                    keyType = entry.left.getExactTypeIfKnown(keyspace);
+                if (valueType == null)
+                    valueType = entry.right.getExactTypeIfKnown(keyspace);
+                if (keyType != null && valueType != null)
+                    return MapType.getInstance(keyType, valueType, false);
             }
-            sb.append("}");
-            return sb.toString();
+            return null;
+        }
+
+        public String getText()
+        {
+            return entries.stream()
+                    .map(entry -> String.format("%s: %s", entry.left.getText(), entry.right.getText()))
+                    .collect(Collectors.joining(", ", "{", "}"));
         }
     }
 
     public static class Value extends Term.Terminal
     {
-        public final Map<ByteBuffer, ByteBuffer> map;
+        public final SortedMap<ByteBuffer, ByteBuffer> map;
 
-        public Value(Map<ByteBuffer, ByteBuffer> map)
+        public Value(SortedMap<ByteBuffer, ByteBuffer> map)
         {
             this.map = map;
         }
 
-        public static Value fromSerialized(ByteBuffer value, MapType type, int version) throws InvalidRequestException
+        public static Value fromSerialized(ByteBuffer value, MapType type, ProtocolVersion version) throws InvalidRequestException
         {
             try
             {
                 // Collections have this small hack that validate cannot be called on a serialized object,
                 // but compose does the validation (so we're fine).
                 Map<?, ?> m = type.getSerializer().deserializeForNativeProtocol(value, version);
-                Map<ByteBuffer, ByteBuffer> map = new LinkedHashMap<>(m.size());
+                // We depend on Maps to be properly sorted by their keys, so use a sorted map implementation here.
+                SortedMap<ByteBuffer, ByteBuffer> map = new TreeMap<>(type.getKeysType());
                 for (Map.Entry<?, ?> entry : m.entrySet())
                     map.put(type.getKeysType().decompose(entry.getKey()), type.getValuesType().decompose(entry.getValue()));
                 return new Value(map);
@@ -171,7 +197,7 @@ public abstract class Maps
             }
         }
 
-        public ByteBuffer get(int protocolVersion)
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             List<ByteBuffer> buffers = new ArrayList<>(2 * map.size());
             for (Map.Entry<ByteBuffer, ByteBuffer> entry : map.entrySet())
@@ -226,19 +252,16 @@ public abstract class Maps
 
         public Terminal bind(QueryOptions options) throws InvalidRequestException
         {
-            Map<ByteBuffer, ByteBuffer> buffers = new TreeMap<ByteBuffer, ByteBuffer>(comparator);
+            SortedMap<ByteBuffer, ByteBuffer> buffers = new TreeMap<>(comparator);
             for (Map.Entry<Term, Term> entry : elements.entrySet())
             {
                 // We don't support values > 64K because the serialization format encode the length as an unsigned short.
                 ByteBuffer keyBytes = entry.getKey().bindAndGet(options);
+
                 if (keyBytes == null)
                     throw new InvalidRequestException("null is not supported inside collections");
                 if (keyBytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                     throw new InvalidRequestException("unset value is not supported for map keys");
-                if (keyBytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("Map key is too long. Map keys are limited to %d bytes but %d bytes keys provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    keyBytes.remaining()));
 
                 ByteBuffer valueBytes = entry.getValue().bindAndGet(options);
                 if (valueBytes == null)
@@ -246,20 +269,15 @@ public abstract class Maps
                 if (valueBytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                     return UNSET_VALUE;
 
-                if (valueBytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("Map value is too long. Map values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    valueBytes.remaining()));
-
                 buffers.put(keyBytes, valueBytes);
             }
             return new Value(buffers);
         }
 
-        public Iterable<Function> getFunctions()
+        public void addFunctionsTo(List<Function> functions)
         {
-            return Iterables.concat(Terms.getFunctions(elements.keySet()),
-                                    Terms.getFunctions(elements.values()));
+            Terms.addFunctions(elements.keySet(), functions);
+            Terms.addFunctions(elements.values(), functions);
         }
     }
 
@@ -337,14 +355,93 @@ public abstract class Maps
             }
             else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER)
             {
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("Map value is too long. Map values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    value.remaining()));
-
                 params.addCell(column, path, value);
             }
+        }
+    }
+
+    // Currently only used internally counters support in SuperColumn families.
+    // Addition on the element level inside the collections are otherwise not supported in the CQL.
+    public static class AdderByKey extends Operation
+    {
+        private final Term k;
+
+        public AdderByKey(ColumnDefinition column, Term t, Term k)
+        {
+            super(column, t);
+            this.k = k;
+        }
+
+        @Override
+        public void collectMarkerSpecification(VariableSpecifications boundNames)
+        {
+            super.collectMarkerSpecification(boundNames);
+            k.collectMarkerSpecification(boundNames);
+        }
+
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
+        {
+            assert column.type.isMultiCell() : "Attempted to set a value for a single key on a frozen map";
+
+            ByteBuffer key = k.bindAndGet(params.options);
+            ByteBuffer value = t.bindAndGet(params.options);
+
+            if (key == null)
+                throw new InvalidRequestException("Invalid null map key");
+            if (key == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new InvalidRequestException("Invalid unset map key");
+
+            if (value == null)
+                throw new InvalidRequestException("Invalid null value for counter increment");
+            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return;
+
+            long increment = ByteBufferUtil.toLong(value);
+            params.addCounter(column, increment, CellPath.create(key));
+        }
+    }
+
+    // Currently only used internally counters support in SuperColumn families.
+    // Addition on the element level inside the collections are otherwise not supported in the CQL.
+    public static class SubtracterByKey extends Operation
+    {
+        private final Term k;
+
+        public SubtracterByKey(ColumnDefinition column, Term t, Term k)
+        {
+            super(column, t);
+            this.k = k;
+        }
+
+        @Override
+        public void collectMarkerSpecification(VariableSpecifications boundNames)
+        {
+            super.collectMarkerSpecification(boundNames);
+            k.collectMarkerSpecification(boundNames);
+        }
+
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
+        {
+            assert column.type.isMultiCell() : "Attempted to set a value for a single key on a frozen map";
+
+            ByteBuffer key = k.bindAndGet(params.options);
+            ByteBuffer value = t.bindAndGet(params.options);
+
+            if (key == null)
+                throw new InvalidRequestException("Invalid null map key");
+            if (key == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new InvalidRequestException("Invalid unset map key");
+
+            if (value == null)
+                throw new InvalidRequestException("Invalid null value for counter increment");
+            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return;
+
+            long increment = ByteBufferUtil.toLong(value);
+            if (increment == Long.MIN_VALUE)
+                throw new InvalidRequestException("The negation of " + increment + " overflows supported counter precision (signed 8 bytes integer)");
+
+            params.addCounter(column, -increment, CellPath.create(key));
         }
     }
 
@@ -370,7 +467,7 @@ public abstract class Maps
                 if (value == null)
                     return;
 
-                Map<ByteBuffer, ByteBuffer> elements = ((Value) value).map;
+                SortedMap<ByteBuffer, ByteBuffer> elements = ((Value) value).map;
                 for (Map.Entry<ByteBuffer, ByteBuffer> entry : elements.entrySet())
                     params.addCell(column, CellPath.create(entry.getKey()), entry.getValue());
             }
@@ -380,7 +477,7 @@ public abstract class Maps
                 if (value == null)
                     params.addTombstone(column);
                 else
-                    params.addCell(column, value.get(Server.CURRENT_VERSION));
+                    params.addCell(column, value.get(ProtocolVersion.CURRENT));
             }
         }
     }

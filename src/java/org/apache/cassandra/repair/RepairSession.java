@@ -23,8 +23,8 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.*;
 import org.slf4j.Logger;
@@ -54,8 +54,8 @@ import org.apache.cassandra.utils.Pair;
  *      validationComplete()).
  *   </li>
  *   <li>Synchronization phase: once all trees are received, the job compares each tree with
- *      all the other using a so-called {@link SyncTask}. If there is difference between 2 trees, the
- *      concerned SyncTask will start a streaming of the difference between the 2 endpoint concerned.
+ *      all the others and creates a {@link SyncTask} for each diverging replica. If there are differences
+ *      between 2 trees, the concerned SyncTask stream the differences between the 2 endpoints concerned.
  *   </li>
  * </ol>
  * The job is done once all its SyncTasks are done (i.e. have either computed no differences
@@ -87,13 +87,11 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
     public final String keyspace;
     private final String[] cfnames;
     public final RepairParallelism parallelismDegree;
+    public final boolean pullRepair;
     /** Range to repair */
     public final Collection<Range<Token>> ranges;
     public final Set<InetAddress> endpoints;
     public final long repairedAt;
-
-    // number of validations left to be performed
-    private final AtomicInteger validationRemaining;
 
     private final AtomicBoolean isFailed = new AtomicBoolean(false);
 
@@ -103,7 +101,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
     private final ConcurrentMap<Pair<RepairJobDesc, NodePair>, RemoteSyncTask> syncingTasks = new ConcurrentHashMap<>();
 
     // Tasks(snapshot, validate request, differencing, ...) are run on taskExecutor
-    public final ListeningExecutorService taskExecutor = MoreExecutors.listeningDecorator(DebuggableThreadPoolExecutor.createCachedThreadpoolWithMaxSize("RepairJobTask"));
+    public final ListeningExecutorService taskExecutor;
 
     private volatile boolean terminated = false;
 
@@ -117,6 +115,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
      * @param parallelismDegree specifies the degree of parallelism when calculating the merkle trees
      * @param endpoints the data centers that should be part of the repair; null for all DCs
      * @param repairedAt when the repair occurred (millis)
+     * @param pullRepair true if the repair should be one way (from remote host to this host and only applicable between two hosts--see RepairOption)
      * @param cfnames names of columnfamilies
      */
     public RepairSession(UUID parentRepairSession,
@@ -126,6 +125,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
                          RepairParallelism parallelismDegree,
                          Set<InetAddress> endpoints,
                          long repairedAt,
+                         boolean pullRepair,
                          String... cfnames)
     {
         assert cfnames.length > 0 : "Repairing no column families seems pointless, doesn't it";
@@ -138,7 +138,14 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         this.ranges = ranges;
         this.endpoints = endpoints;
         this.repairedAt = repairedAt;
-        this.validationRemaining = new AtomicInteger(cfnames.length);
+        this.pullRepair = pullRepair;
+        this.taskExecutor = MoreExecutors.listeningDecorator(createExecutor());
+    }
+
+    @VisibleForTesting
+    protected DebuggableThreadPoolExecutor createExecutor()
+    {
+        return DebuggableThreadPoolExecutor.createCachedThreadpoolWithMaxSize("RepairJobTask");
     }
 
     public UUID getId()
@@ -181,14 +188,6 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         logger.info("[repair #{}] {}", getId(), message);
         Tracing.traceRepair(message);
         task.treesReceived(trees);
-
-        // Unregister from FailureDetector once we've completed synchronizing Merkle trees.
-        // After this point, we rely on tcp_keepalive for individual sockets to notify us when a connection is down.
-        // See CASSANDRA-3569
-        if (validationRemaining.decrementAndGet() == 0)
-        {
-            FailureDetector.instance.unregisterFailureDetectionEventListener(this);
-        }
     }
 
     /**
@@ -207,8 +206,14 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
             return;
         }
 
-        logger.debug(String.format("[repair #%s] Repair completed between %s and %s on %s", getId(), nodes.endpoint1, nodes.endpoint2, desc.columnFamily));
+        logger.debug("[repair #{}] Repair completed between {} and {} on {}", getId(), nodes.endpoint1, nodes.endpoint2, desc.columnFamily);
         task.syncComplete(success);
+    }
+
+    @VisibleForTesting
+    Map<Pair<RepairJobDesc, NodePair>, RemoteSyncTask> getSyncingTasks()
+    {
+        return Collections.unmodifiableMap(syncingTasks);
     }
 
     private String repairedNodes()
@@ -234,7 +239,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         if (terminated)
             return;
 
-        logger.info(String.format("[repair #%s] new session: will sync %s on range %s for %s.%s", getId(), repairedNodes(), ranges, keyspace, Arrays.toString(cfnames)));
+        logger.info("[repair #{}] new session: will sync {} on range {} for {}.{}", getId(), repairedNodes(), ranges, keyspace, Arrays.toString(cfnames));
         Tracing.traceRepair("Syncing range {}", ranges);
         SystemDistributedKeyspace.startRepairs(getId(), parentRepairSession, keyspace, cfnames, ranges, endpoints);
 
@@ -309,15 +314,24 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
     public void forceShutdown(Throwable reason)
     {
         setException(reason);
+
+        // Ensure that all outstandig futures are cancled.
+        // Otherwise, when task executer will be shutdown later in this method, the thread of the repair job will
+        // wait forever on the outstanding futures. If that happen the repair thread won't be finished and won't release the memory.
+
+        for (ValidationTask validationTask: validating.values())
+        {
+            validationTask.cancel(true);
+        }
+
+        for (RemoteSyncTask syncTask: syncingTasks.values())
+        {
+            syncTask.cancel(true);
+        }
+
         taskExecutor.shutdownNow();
         terminate();
     }
-
-    public void onJoin(InetAddress endpoint, EndpointState epState) {}
-    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}
-    public void onAlive(InetAddress endpoint, EndpointState state) {}
-    public void onDead(InetAddress endpoint, EndpointState state) {}
 
     public void onRemove(InetAddress endpoint)
     {

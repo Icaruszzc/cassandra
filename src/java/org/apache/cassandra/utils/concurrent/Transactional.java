@@ -74,7 +74,6 @@ public interface Transactional extends AutoCloseable
             ABORTED;
         }
 
-        private boolean permitRedundantTransitions;
         private State state = State.IN_PROGRESS;
 
         // the methods for actually performing the necessary behaviours, that are themselves protected against
@@ -88,7 +87,8 @@ public interface Transactional extends AutoCloseable
         // Transactional objects will perform cleanup in the commit() or abort() calls
 
         /**
-         * perform an exception-safe pre-abort cleanup; this will still be run *after* commit
+         * perform an exception-safe pre-abort/commit cleanup;
+         * this will be run after prepareToCommit (so before commit), and before abort
          */
         protected Throwable doPreCleanup(Throwable accumulate){ return accumulate; }
 
@@ -108,12 +108,9 @@ public interface Transactional extends AutoCloseable
          */
         public final Throwable commit(Throwable accumulate)
         {
-            if (permitRedundantTransitions && state == State.COMMITTED)
-                return accumulate;
             if (state != State.READY_TO_COMMIT)
                 throw new IllegalStateException("Cannot commit unless READY_TO_COMMIT; state is " + state);
             accumulate = doCommit(accumulate);
-            accumulate = doPreCleanup(accumulate);
             accumulate = doPostCleanup(accumulate);
             state = State.COMMITTED;
             return accumulate;
@@ -165,12 +162,11 @@ public interface Transactional extends AutoCloseable
          */
         public final void prepareToCommit()
         {
-            if (permitRedundantTransitions && state == State.READY_TO_COMMIT)
-                return;
             if (state != State.IN_PROGRESS)
                 throw new IllegalStateException("Cannot prepare to commit unless IN_PROGRESS; state is " + state);
 
             doPrepare();
+            maybeFail(doPreCleanup(null));
             state = State.READY_TO_COMMIT;
         }
 
@@ -203,11 +199,6 @@ public interface Transactional extends AutoCloseable
         {
             return state;
         }
-
-        protected void permitRedundantTransitions()
-        {
-            permitRedundantTransitions = true;
-        }
     }
 
     // commit should generally never throw an exception, and preferably never generate one,
@@ -220,4 +211,7 @@ public interface Transactional extends AutoCloseable
     Throwable abort(Throwable accumulate);
 
     void prepareToCommit();
+
+    // close() does not throw
+    public void close();
 }

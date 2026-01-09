@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
@@ -32,11 +33,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap;
-import com.googlecode.concurrentlinkedhashmap.EntryWeigher;
-import com.googlecode.concurrentlinkedhashmap.EvictionListener;
 import org.antlr.runtime.*;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.functions.FunctionName;
 import org.apache.cassandra.cql3.statements.*;
@@ -46,42 +47,29 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionIterators;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.metrics.CQLMetrics;
 import org.apache.cassandra.service.*;
 import org.apache.cassandra.service.pager.QueryPager;
 import org.apache.cassandra.thrift.ThriftClientState;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.*;
-import org.github.jamm.MemoryMeter;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
 
 public class QueryProcessor implements QueryHandler
 {
-    public static final CassandraVersion CQL_VERSION = new CassandraVersion("3.3.0");
+    public static final CassandraVersion CQL_VERSION = new CassandraVersion("3.4.4");
+
+    // See comments on QueryProcessor #prepare
+    public static final CassandraVersion NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_30 = new CassandraVersion("3.0.26");
+    public static final CassandraVersion NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_3X = new CassandraVersion("3.11.12");
 
     public static final QueryProcessor instance = new QueryProcessor();
 
     private static final Logger logger = LoggerFactory.getLogger(QueryProcessor.class);
-    private static final MemoryMeter meter = new MemoryMeter().withGuessing(MemoryMeter.Guess.FALLBACK_BEST).ignoreKnownSingletons();
-    private static final long MAX_CACHE_PREPARED_MEMORY = Runtime.getRuntime().maxMemory() / 256;
-
-    private static final EntryWeigher<MD5Digest, ParsedStatement.Prepared> cqlMemoryUsageWeigher = new EntryWeigher<MD5Digest, ParsedStatement.Prepared>()
-    {
-        @Override
-        public int weightOf(MD5Digest key, ParsedStatement.Prepared value)
-        {
-            return Ints.checkedCast(measure(key) + measure(value.statement) + measure(value.boundNames));
-        }
-    };
-
-    private static final EntryWeigher<Integer, ParsedStatement.Prepared> thriftMemoryUsageWeigher = new EntryWeigher<Integer, ParsedStatement.Prepared>()
-    {
-        @Override
-        public int weightOf(Integer key, ParsedStatement.Prepared value)
-        {
-            return Ints.checkedCast(measure(key) + measure(value.statement) + measure(value.boundNames));
-        }
-    };
 
     private static final ConcurrentLinkedHashMap<MD5Digest, ParsedStatement.Prepared> preparedStatements;
     private static final ConcurrentLinkedHashMap<Integer, ParsedStatement.Prepared> thriftPreparedStatements;
@@ -95,45 +83,49 @@ public class QueryProcessor implements QueryHandler
     public static final CQLMetrics metrics = new CQLMetrics();
 
     private static final AtomicInteger lastMinuteEvictionsCount = new AtomicInteger(0);
+    private static final AtomicInteger thriftLastMinuteEvictionsCount = new AtomicInteger(0);
 
     static
     {
         preparedStatements = new ConcurrentLinkedHashMap.Builder<MD5Digest, ParsedStatement.Prepared>()
-                             .maximumWeightedCapacity(MAX_CACHE_PREPARED_MEMORY)
-                             .weigher(cqlMemoryUsageWeigher)
-                             .listener(new EvictionListener<MD5Digest, ParsedStatement.Prepared>()
-                             {
-                                 public void onEviction(MD5Digest md5Digest, ParsedStatement.Prepared prepared)
-                                 {
-                                     metrics.preparedStatementsEvicted.inc();
-                                     lastMinuteEvictionsCount.incrementAndGet();
-                                 }
+                             .maximumWeightedCapacity(capacityToBytes(DatabaseDescriptor.getPreparedStatementsCacheSizeMB()))
+                             .weigher(QueryProcessor::measure)
+                             .listener((md5Digest, prepared) -> {
+                                 metrics.preparedStatementsEvicted.inc();
+                                 lastMinuteEvictionsCount.incrementAndGet();
+                                 SystemKeyspace.removePreparedStatement(md5Digest);
                              }).build();
 
         thriftPreparedStatements = new ConcurrentLinkedHashMap.Builder<Integer, ParsedStatement.Prepared>()
-                                   .maximumWeightedCapacity(MAX_CACHE_PREPARED_MEMORY)
-                                   .weigher(thriftMemoryUsageWeigher)
-                                   .listener(new EvictionListener<Integer, ParsedStatement.Prepared>()
-                                   {
-                                       public void onEviction(Integer integer, ParsedStatement.Prepared prepared)
-                                       {
-                                           metrics.preparedStatementsEvicted.inc();
-                                           lastMinuteEvictionsCount.incrementAndGet();
-                                       }
+                                   .maximumWeightedCapacity(capacityToBytes(DatabaseDescriptor.getThriftPreparedStatementsCacheSizeMB()))
+                                   .weigher(QueryProcessor::measure)
+                                   .listener((integer, prepared) -> {
+                                       metrics.preparedStatementsEvicted.inc();
+                                       thriftLastMinuteEvictionsCount.incrementAndGet();
                                    })
                                    .build();
 
-        ScheduledExecutors.scheduledTasks.scheduleAtFixedRate(new Runnable()
-        {
-            public void run()
-            {
-                long count = lastMinuteEvictionsCount.getAndSet(0);
-                if (count > 0)
-                    logger.info("{} prepared statements discarded in the last minute because cache limit reached ({} bytes)",
-                                count,
-                                MAX_CACHE_PREPARED_MEMORY);
-            }
+        ScheduledExecutors.scheduledTasks.scheduleAtFixedRate(() -> {
+            long count = lastMinuteEvictionsCount.getAndSet(0);
+            if (count > 0)
+                logger.warn("{} prepared statements discarded in the last minute because cache limit reached ({} MB)",
+                            count,
+                            DatabaseDescriptor.getPreparedStatementsCacheSizeMB());
+            count = thriftLastMinuteEvictionsCount.getAndSet(0);
+            if (count > 0)
+                logger.warn("{} prepared Thrift statements discarded in the last minute because cache limit reached ({} MB)",
+                            count,
+                            DatabaseDescriptor.getThriftPreparedStatementsCacheSizeMB());
         }, 1, 1, TimeUnit.MINUTES);
+
+        logger.info("Initialized prepared statement caches with {} MB (native) and {} MB (Thrift)",
+                    DatabaseDescriptor.getPreparedStatementsCacheSizeMB(),
+                    DatabaseDescriptor.getThriftPreparedStatementsCacheSizeMB());
+    }
+
+    private static long capacityToBytes(long cacheSizeMB)
+    {
+        return cacheSizeMB * 1024 * 1024;
     }
 
     public static int preparedStatementsCount()
@@ -151,12 +143,53 @@ public class QueryProcessor implements QueryHandler
         InternalStateInstance()
         {
             ClientState state = ClientState.forInternalCalls();
-            state.setKeyspace(SystemKeyspace.NAME);
+            state.setKeyspace(SchemaConstants.SYSTEM_KEYSPACE_NAME);
             this.queryState = new QueryState(state);
         }
     }
 
-    private static QueryState internalQueryState()
+    public void preloadPreparedStatements()
+    {
+        int count = SystemKeyspace.loadPreparedStatements((id, query, keyspace) -> {
+            try
+            {
+                ClientState clientState = ClientState.forInternalCalls();
+                if (keyspace != null)
+                    clientState.setKeyspace(keyspace);
+                ParsedStatement.Prepared prepared = getStatement(query, clientState);
+                preparedStatements.putIfAbsent(id, prepared);
+                // Preload `null` statement for non-fully qualified statements, since it can't be parsed if loaded from cache and will be dropped
+                if (!prepared.fullyQualified)
+                    preparedStatements.putIfAbsent(computeId(query, null), getStatement(query, clientState));
+                return true;
+            }
+            catch (Throwable e)
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                logger.warn(String.format("Prepared statement recreation error, removing statement: %s %s %s", id, query, keyspace));
+                SystemKeyspace.removePreparedStatement(id);
+                return false;
+            }
+        });
+        logger.info("Preloaded {} prepared statements", count);
+    }
+
+
+    /**
+     * Clears the prepared statement cache.
+     * @param memoryOnly {@code true} if only the in memory caches must be cleared, {@code false} otherwise.
+     */
+    @VisibleForTesting
+    public static void clearPreparedStatements(boolean memoryOnly)
+    {
+        preparedStatements.clear();
+        thriftPreparedStatements.clear();
+        if (!memoryOnly)
+            SystemKeyspace.resetPreparedStatements();
+    }
+
+    @VisibleForTesting
+    public static QueryState internalQueryState()
     {
         return InternalStateInstance.INSTANCE.queryState;
     }
@@ -164,6 +197,12 @@ public class QueryProcessor implements QueryHandler
     private QueryProcessor()
     {
         MigrationManager.instance.register(new MigrationSubscriber());
+    }
+
+    @VisibleForTesting
+    public void evictPrepared(MD5Digest id)
+    {
+        preparedStatements.remove(id);
     }
 
     public ParsedStatement.Prepared getPrepared(MD5Digest id)
@@ -193,7 +232,7 @@ public class QueryProcessor implements QueryHandler
         }
     }
 
-    public ResultMessage processStatement(CQLStatement statement, QueryState queryState, QueryOptions options)
+    public ResultMessage processStatement(CQLStatement statement, QueryState queryState, QueryOptions options, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
         logger.trace("Process {} @CL.{}", statement, options.getConsistency());
@@ -201,26 +240,26 @@ public class QueryProcessor implements QueryHandler
         statement.checkAccess(clientState);
         statement.validate(clientState);
 
-        ResultMessage result = statement.execute(queryState, options);
+        ResultMessage result = statement.execute(queryState, options, queryStartNanoTime);
         return result == null ? new ResultMessage.Void() : result;
     }
 
-    public static ResultMessage process(String queryString, ConsistencyLevel cl, QueryState queryState)
+    public static ResultMessage process(String queryString, ConsistencyLevel cl, QueryState queryState, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
-        return instance.process(queryString, queryState, QueryOptions.forInternalCalls(cl, Collections.<ByteBuffer>emptyList()));
+        return instance.process(queryString, queryState, QueryOptions.forInternalCalls(cl, Collections.<ByteBuffer>emptyList()), queryStartNanoTime);
     }
 
     public ResultMessage process(String query,
                                  QueryState state,
                                  QueryOptions options,
-                                 Map<String, ByteBuffer> customPayload)
-                                         throws RequestExecutionException, RequestValidationException
+                                 Map<String, ByteBuffer> customPayload,
+                                 long queryStartNanoTime) throws RequestExecutionException, RequestValidationException
     {
-        return process(query, state, options);
+        return process(query, state, options, queryStartNanoTime);
     }
 
-    public ResultMessage process(String queryString, QueryState queryState, QueryOptions options)
+    public ResultMessage process(String queryString, QueryState queryState, QueryOptions options, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
         ParsedStatement.Prepared p = getStatement(queryString, queryState.getClientState());
@@ -232,7 +271,7 @@ public class QueryProcessor implements QueryHandler
         if (!queryState.getClientState().isInternal)
             metrics.regularStatementsExecuted.inc();
 
-        return processStatement(prepared, queryState, options);
+        return processStatement(prepared, queryState, options, queryStartNanoTime);
     }
 
     public static ParsedStatement.Prepared parseStatement(String queryStr, QueryState queryState) throws RequestValidationException
@@ -247,14 +286,15 @@ public class QueryProcessor implements QueryHandler
 
     public static UntypedResultSet process(String query, ConsistencyLevel cl, List<ByteBuffer> values) throws RequestExecutionException
     {
-        ResultMessage result = instance.process(query, QueryState.forInternalCalls(), QueryOptions.forInternalCalls(cl, values));
+        ResultMessage result = instance.process(query, QueryState.forInternalCalls(), QueryOptions.forInternalCalls(cl, values), System.nanoTime());
         if (result instanceof ResultMessage.Rows)
             return UntypedResultSet.create(((ResultMessage.Rows)result).result);
         else
             return null;
     }
 
-    private static QueryOptions makeInternalOptions(ParsedStatement.Prepared prepared, Object[] values)
+    @VisibleForTesting
+    public static QueryOptions makeInternalOptions(ParsedStatement.Prepared prepared, Object[] values)
     {
         return makeInternalOptions(prepared, values, ConsistencyLevel.ONE);
     }
@@ -264,7 +304,7 @@ public class QueryProcessor implements QueryHandler
         if (prepared.boundNames.size() != values.length)
             throw new IllegalArgumentException(String.format("Invalid number of values. Expecting %d but got %d", prepared.boundNames.size(), values.length));
 
-        List<ByteBuffer> boundValues = new ArrayList<ByteBuffer>(values.length);
+        List<ByteBuffer> boundValues = new ArrayList<>(values.length);
         for (int i = 0; i < values.length; i++)
         {
             Object value = values[i];
@@ -274,7 +314,7 @@ public class QueryProcessor implements QueryHandler
         return QueryOptions.forInternalCalls(cl, boundValues);
     }
 
-    private static ParsedStatement.Prepared prepareInternal(String query) throws RequestValidationException
+    public static ParsedStatement.Prepared prepareInternal(String query) throws RequestValidationException
     {
         ParsedStatement.Prepared prepared = internalStatements.get(query);
         if (prepared != null)
@@ -297,13 +337,19 @@ public class QueryProcessor implements QueryHandler
             return null;
     }
 
+    public static UntypedResultSet execute(String query, ConsistencyLevel cl, Object... values)
+    throws RequestExecutionException
+    {
+        return execute(query, cl, internalQueryState(), values);
+    }
+
     public static UntypedResultSet execute(String query, ConsistencyLevel cl, QueryState state, Object... values)
     throws RequestExecutionException
     {
         try
         {
             ParsedStatement.Prepared prepared = prepareInternal(query);
-            ResultMessage result = prepared.statement.execute(state, makeInternalOptions(prepared, values));
+            ResultMessage result = prepared.statement.execute(state, makeInternalOptions(prepared, values, cl), System.nanoTime());
             if (result instanceof ResultMessage.Rows)
                 return UntypedResultSet.create(((ResultMessage.Rows)result).result);
             else
@@ -322,7 +368,7 @@ public class QueryProcessor implements QueryHandler
             throw new IllegalArgumentException("Only SELECTs can be paged");
 
         SelectStatement select = (SelectStatement)prepared.statement;
-        QueryPager pager = select.getQuery(makeInternalOptions(prepared, values), FBUtilities.nowInSeconds()).getPager(null);
+        QueryPager pager = select.getQuery(makeInternalOptions(prepared, values), FBUtilities.nowInSeconds()).getPager(null, ProtocolVersion.CURRENT);
         return UntypedResultSet.create(select, pager, pageSize);
     }
 
@@ -339,6 +385,21 @@ public class QueryProcessor implements QueryHandler
             return UntypedResultSet.create(((ResultMessage.Rows)result).result);
         else
             return null;
+    }
+
+    /**
+     * A special version of executeInternal that takes the time used as "now" for the query in argument.
+     * Note that this only make sense for Selects so this only accept SELECT statements and is only useful in rare
+     * cases.
+     */
+    public static UntypedResultSet executeInternalWithNow(int nowInSec, long queryStartNanoTime, String query, Object... values)
+    {
+        ParsedStatement.Prepared prepared = prepareInternal(query);
+        assert prepared.statement instanceof SelectStatement;
+        SelectStatement select = (SelectStatement)prepared.statement;
+        ResultMessage result = select.executeInternal(internalQueryState(), makeInternalOptions(prepared, values), nowInSec, queryStartNanoTime);
+        assert result instanceof ResultMessage.Rows;
+        return UntypedResultSet.create(((ResultMessage.Rows)result).result);
     }
 
     public static UntypedResultSet resultify(String query, RowIterator partition)
@@ -369,19 +430,114 @@ public class QueryProcessor implements QueryHandler
         return prepare(queryString, cState, cState instanceof ThriftClientState);
     }
 
-    public static ResultMessage.Prepared prepare(String queryString, ClientState clientState, boolean forThrift)
+    private volatile boolean newPreparedStatementBehaviour = false;
+    public boolean useNewPreparedStatementBehaviour()
     {
-        ResultMessage.Prepared existing = getStoredPreparedStatement(queryString, clientState.getRawKeyspace(), forThrift);
-        if (existing != null)
-            return existing;
+        if (newPreparedStatementBehaviour || DatabaseDescriptor.getForceNewPreparedStatementBehaviour())
+            return true;
+
+        synchronized (this)
+        {
+            CassandraVersion minVersion = Gossiper.instance.getMinVersion(DatabaseDescriptor.getWriteRpcTimeout(), TimeUnit.MILLISECONDS);
+            if (minVersion != null &&
+                ((minVersion.is30() && minVersion.compareTo(NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_30) >= 0) ||
+                 (minVersion.compareTo(NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_3X) >= 0)))
+            {
+                logger.info("Fully upgraded to at least {}", minVersion);
+                newPreparedStatementBehaviour = true;
+            }
+
+            return newPreparedStatementBehaviour;
+        }
+    }
+
+    /**
+     * This method got slightly out of hand, but this is with best intentions: to allow users to be upgraded from any
+     * prior version, and help implementers avoid previous mistakes by clearly separating fully qualified and non-fully
+     * qualified statement behaviour.
+     *
+     * Basically we need to handle 4 different hashes here;
+     * 1. fully qualified query with keyspace
+     * 2. fully qualified query without keyspace
+     * 3. unqualified query with keyspace
+     * 4. unqualified query without keyspace
+     *
+     * The correct combination to return is 2/3 - the problem is during upgrades (assuming upgrading from < 3.0.26)
+     * - Existing clients have hash 1 or 3
+     * - Query prepared on a 3.0.26/3.11.12 instance needs to return hash 1/3 to be able to execute it on a 3.0.25 instance
+     * - This is handled by the useNewPreparedStatementBehaviour flag - while there still are 3.0.25 instances in
+     *   the cluster we always return hash 1/3
+     * - Once fully upgraded we start returning hash 2/3, this will cause a prepared statement id mismatch for existing
+     *   clients, but they will be able to continue using the old prepared statement id after that exception since we
+     *   store the query both with and without keyspace.
+     */
+    public ResultMessage.Prepared prepare(String queryString, ClientState clientState, boolean forThrift)
+    {
+        boolean useNewPreparedStatementBehaviour = useNewPreparedStatementBehaviour();
+
+        MD5Digest hashWithoutKeyspace = computeId(queryString, null);
+        MD5Digest hashWithKeyspace = computeId(queryString, clientState.getRawKeyspace());
+        ParsedStatement.Prepared cachedWithoutKeyspace = preparedStatements.get(hashWithoutKeyspace);
+        ParsedStatement.Prepared cachedWithKeyspace = preparedStatements.get(hashWithKeyspace);
+        // We assume it is only safe to return cached prepare if we have both instances
+        boolean safeToReturnCached = cachedWithoutKeyspace != null && cachedWithKeyspace != null;
+
+        if (!forThrift)
+        {
+            if (safeToReturnCached)
+            {
+                if (useNewPreparedStatementBehaviour)
+                {
+                    if (cachedWithoutKeyspace.fullyQualified) // For fully qualified statements, we always skip keyspace to avoid digest switching
+                        return new ResultMessage.Prepared(hashWithoutKeyspace, cachedWithoutKeyspace);
+
+                    if (clientState.getRawKeyspace() != null && !cachedWithKeyspace.fullyQualified) // For non-fully qualified statements, we always include keyspace to avoid ambiguity
+                        return new ResultMessage.Prepared(hashWithKeyspace, cachedWithKeyspace);
+                }
+                else // legacy caches, pre-CASSANDRA-15252 behaviour
+                {
+                    return new ResultMessage.Prepared(hashWithKeyspace, cachedWithKeyspace);
+                }
+            }
+            else
+            {
+                // Make sure the missing one is going to be eventually re-prepared
+                evictPrepared(hashWithKeyspace);
+                evictPrepared(hashWithoutKeyspace);
+            }
+        }
 
         ParsedStatement.Prepared prepared = getStatement(queryString, clientState);
+        prepared.rawCQLStatement = queryString;
+
         int boundTerms = prepared.statement.getBoundTerms();
         if (boundTerms > FBUtilities.MAX_UNSIGNED_SHORT)
             throw new InvalidRequestException(String.format("Too many markers(?). %d markers exceed the allowed maximum of %d", boundTerms, FBUtilities.MAX_UNSIGNED_SHORT));
         assert boundTerms == prepared.boundNames.size();
 
-        return storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, forThrift);
+        if (prepared.fullyQualified)
+        {
+            ResultMessage.Prepared qualifiedWithoutKeyspace = storePreparedStatement(queryString, null, prepared, forThrift);
+            ResultMessage.Prepared qualifiedWithKeyspace = null;
+            if (clientState.getRawKeyspace() != null)
+                qualifiedWithKeyspace = storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, forThrift);
+
+            if (!newPreparedStatementBehaviour && qualifiedWithKeyspace != null)
+                return qualifiedWithKeyspace;
+
+            return qualifiedWithoutKeyspace;
+        }
+        else
+        {
+            clientState.warnAboutUseWithPreparedStatements(hashWithKeyspace, clientState.getRawKeyspace());
+
+            ResultMessage.Prepared nonQualifiedWithKeyspace = storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, forThrift);
+            ResultMessage.Prepared nonQualifiedWithNullKeyspace = storePreparedStatement(queryString, null, prepared, forThrift);
+            if (!useNewPreparedStatementBehaviour)
+                return nonQualifiedWithNullKeyspace;
+
+            return nonQualifiedWithKeyspace;
+        }
     }
 
     private static MD5Digest computeId(String queryString, String keyspace)
@@ -396,44 +552,65 @@ public class QueryProcessor implements QueryHandler
         return toHash.hashCode();
     }
 
-    private static ResultMessage.Prepared getStoredPreparedStatement(String queryString, String keyspace, boolean forThrift)
+    @VisibleForTesting
+    public static ResultMessage.Prepared getStoredPreparedStatement(String queryString, String clientKeyspace, boolean forThrift)
     throws InvalidRequestException
     {
         if (forThrift)
         {
-            Integer thriftStatementId = computeThriftId(queryString, keyspace);
+            Integer thriftStatementId = computeThriftId(queryString, clientKeyspace);
             ParsedStatement.Prepared existing = thriftPreparedStatements.get(thriftStatementId);
-            return existing == null ? null : ResultMessage.Prepared.forThrift(thriftStatementId, existing.boundNames);
+            if (existing == null)
+                return null;
+
+            checkTrue(queryString.equals(existing.rawCQLStatement),
+                      "MD5 hash collision: query with the same MD5 hash was already prepared. \n Existing: '%s'",
+                      existing.rawCQLStatement);
+            return ResultMessage.Prepared.forThrift(thriftStatementId, existing.boundNames);
         }
         else
         {
-            MD5Digest statementId = computeId(queryString, keyspace);
+            MD5Digest statementId = computeId(queryString, clientKeyspace);
             ParsedStatement.Prepared existing = preparedStatements.get(statementId);
-            return existing == null ? null : new ResultMessage.Prepared(statementId, existing);
+            if (existing == null)
+                return null;
+
+            checkTrue(queryString.equals(existing.rawCQLStatement),
+                      "MD5 hash collision: query with the same MD5 hash was already prepared. \n Existing: '%s'",
+                      existing.rawCQLStatement);
+            return new ResultMessage.Prepared(statementId, existing);
         }
     }
 
-    private static ResultMessage.Prepared storePreparedStatement(String queryString, String keyspace, ParsedStatement.Prepared prepared, boolean forThrift)
+    @VisibleForTesting
+    public static ResultMessage.Prepared storePreparedStatement(String queryString, String keyspace, ParsedStatement.Prepared prepared, boolean forThrift)
     throws InvalidRequestException
     {
         // Concatenate the current keyspace so we don't mix prepared statements between keyspace (#5352).
         // (if the keyspace is null, queryString has to have a fully-qualified keyspace so it's fine.
-        long statementSize = measure(prepared.statement);
+        long statementSize = ObjectSizes.measureDeep(prepared.statement);
         // don't execute the statement if it's bigger than the allowed threshold
-        if (statementSize > MAX_CACHE_PREPARED_MEMORY)
-            throw new InvalidRequestException(String.format("Prepared statement of size %d bytes is larger than allowed maximum of %d bytes.",
-                                                            statementSize,
-                                                            MAX_CACHE_PREPARED_MEMORY));
         if (forThrift)
         {
+            if (statementSize > capacityToBytes(DatabaseDescriptor.getThriftPreparedStatementsCacheSizeMB()))
+                throw new InvalidRequestException(String.format("Prepared statement of size %d bytes is larger than allowed maximum of %d MB: %s...",
+                                                                statementSize,
+                                                                DatabaseDescriptor.getThriftPreparedStatementsCacheSizeMB(),
+                                                                queryString.substring(0, 200)));
             Integer statementId = computeThriftId(queryString, keyspace);
             thriftPreparedStatements.put(statementId, prepared);
             return ResultMessage.Prepared.forThrift(statementId, prepared.boundNames);
         }
         else
         {
+            if (statementSize > capacityToBytes(DatabaseDescriptor.getPreparedStatementsCacheSizeMB()))
+                throw new InvalidRequestException(String.format("Prepared statement of size %d bytes is larger than allowed maximum of %d MB: %s...",
+                                                                statementSize,
+                                                                DatabaseDescriptor.getPreparedStatementsCacheSizeMB(),
+                                                                queryString.substring(0, 200)));
             MD5Digest statementId = computeId(queryString, keyspace);
             preparedStatements.put(statementId, prepared);
+            SystemKeyspace.writePreparedStatement(keyspace, statementId, queryString);
             return new ResultMessage.Prepared(statementId, prepared);
         }
     }
@@ -441,13 +618,14 @@ public class QueryProcessor implements QueryHandler
     public ResultMessage processPrepared(CQLStatement statement,
                                          QueryState state,
                                          QueryOptions options,
-                                         Map<String, ByteBuffer> customPayload)
+                                         Map<String, ByteBuffer> customPayload,
+                                         long queryStartNanoTime)
                                                  throws RequestExecutionException, RequestValidationException
     {
-        return processPrepared(statement, state, options);
+        return processPrepared(statement, state, options, queryStartNanoTime);
     }
 
-    public ResultMessage processPrepared(CQLStatement statement, QueryState queryState, QueryOptions options)
+    public ResultMessage processPrepared(CQLStatement statement, QueryState queryState, QueryOptions options, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
         List<ByteBuffer> variables = options.getValues();
@@ -467,26 +645,27 @@ public class QueryProcessor implements QueryHandler
         }
 
         metrics.preparedStatementsExecuted.inc();
-        return processStatement(statement, queryState, options);
+        return processStatement(statement, queryState, options, queryStartNanoTime);
     }
 
     public ResultMessage processBatch(BatchStatement statement,
                                       QueryState state,
                                       BatchQueryOptions options,
-                                      Map<String, ByteBuffer> customPayload)
+                                      Map<String, ByteBuffer> customPayload,
+                                      long queryStartNanoTime)
                                               throws RequestExecutionException, RequestValidationException
     {
-        return processBatch(statement, state, options);
+        return processBatch(statement, state, options, queryStartNanoTime);
     }
 
-    public ResultMessage processBatch(BatchStatement batch, QueryState queryState, BatchQueryOptions options)
+    public ResultMessage processBatch(BatchStatement batch, QueryState queryState, BatchQueryOptions options, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
         ClientState clientState = queryState.getClientState();
         batch.checkAccess(clientState);
         batch.validate();
         batch.validate(clientState);
-        return batch.execute(queryState, options);
+        return batch.execute(queryState, options, queryStartNanoTime);
     }
 
     public static ParsedStatement.Prepared getStatement(String queryStr, ClientState clientState)
@@ -500,31 +679,30 @@ public class QueryProcessor implements QueryHandler
             ((CFStatement)statement).prepareKeyspace(clientState);
 
         Tracing.trace("Preparing statement");
-        return statement.prepare();
+        return statement.prepare(clientState);
     }
 
+    public static <T extends ParsedStatement> T parseStatement(String queryStr, Class<T> klass, String type) throws SyntaxException
+    {
+        try
+        {
+            ParsedStatement stmt = parseStatement(queryStr);
+
+            if (!klass.isAssignableFrom(stmt.getClass()))
+                throw new IllegalArgumentException("Invalid query, must be a " + type + " statement but was: " + stmt.getClass());
+
+            return klass.cast(stmt);
+        }
+        catch (RequestValidationException e)
+        {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+    }
     public static ParsedStatement parseStatement(String queryStr) throws SyntaxException
     {
         try
         {
-            // Lexer and parser
-            ErrorCollector errorCollector = new ErrorCollector(queryStr);
-            CharStream stream = new ANTLRStringStream(queryStr);
-            CqlLexer lexer = new CqlLexer(stream);
-            lexer.addErrorListener(errorCollector);
-
-            TokenStream tokenStream = new CommonTokenStream(lexer);
-            CqlParser parser = new CqlParser(tokenStream);
-            parser.addErrorListener(errorCollector);
-
-            // Parse the query string to a statement instance
-            ParsedStatement statement = parser.query();
-
-            // The errorCollector has queue up any errors that the lexer and parser may have encountered
-            // along the way, if necessary, we turn the last error into exceptions here.
-            errorCollector.throwFirstSyntaxError();
-
-            return statement;
+            return CQLFragmentParser.parseAnyUnhandled(CqlParser::query, queryStr);
         }
         catch (CassandraException ce)
         {
@@ -544,21 +722,79 @@ public class QueryProcessor implements QueryHandler
         }
     }
 
-    private static long measure(Object key)
+    private static int measure(Object key, ParsedStatement.Prepared value)
     {
-        return meter.measureDeep(key);
+        return Ints.checkedCast(ObjectSizes.measureDeep(key) + ObjectSizes.measureDeep(value));
+    }
+
+    /**
+     * Clear our internal statmeent cache for test purposes.
+     */
+    @VisibleForTesting
+    public static void clearInternalStatementsCache()
+    {
+        internalStatements.clear();
+    }
+
+    @VisibleForTesting
+    public static void clearPreparedStatementsCache()
+    {
+        preparedStatements.clear();
+        thriftPreparedStatements.clear();
+    }
+
+    public static List<ParsedStatement.Prepared> getPreparedStatements()
+    {
+        return new ArrayList<>(preparedStatements.values());
     }
 
     private static class MigrationSubscriber extends MigrationListener
     {
-        private void removeInvalidPreparedStatements(String ksName, String cfName)
+        private static void removeInvalidPreparedStatements(String ksName, String cfName)
         {
             removeInvalidPreparedStatements(internalStatements.values().iterator(), ksName, cfName);
-            removeInvalidPreparedStatements(preparedStatements.values().iterator(), ksName, cfName);
+            removeInvalidPersistentPreparedStatements(preparedStatements.entrySet().iterator(), ksName, cfName);
             removeInvalidPreparedStatements(thriftPreparedStatements.values().iterator(), ksName, cfName);
         }
 
-        private void removeInvalidPreparedStatements(Iterator<ParsedStatement.Prepared> iterator, String ksName, String cfName)
+        private static void removeInvalidPreparedStatementsForFunction(String ksName, String functionName)
+        {
+            Predicate<Function> matchesFunction = f -> ksName.equals(f.name().keyspace) && functionName.equals(f.name().name);
+
+            for (Iterator<Map.Entry<MD5Digest, ParsedStatement.Prepared>> iter = preparedStatements.entrySet().iterator();
+                 iter.hasNext();)
+            {
+                Map.Entry<MD5Digest, ParsedStatement.Prepared> pstmt = iter.next();
+                if (Iterables.any(pstmt.getValue().statement.getFunctions(), matchesFunction))
+                {
+                    SystemKeyspace.removePreparedStatement(pstmt.getKey());
+                    iter.remove();
+                }
+            }
+
+
+            Iterators.removeIf(internalStatements.values().iterator(),
+                               statement -> Iterables.any(statement.statement.getFunctions(), matchesFunction));
+
+            Iterators.removeIf(thriftPreparedStatements.values().iterator(),
+                               statement -> Iterables.any(statement.statement.getFunctions(), matchesFunction));
+        }
+
+        private static void removeInvalidPersistentPreparedStatements(Iterator<Map.Entry<MD5Digest, ParsedStatement.Prepared>> iterator,
+                                                                      String ksName, String cfName)
+        {
+            while (iterator.hasNext())
+            {
+                Map.Entry<MD5Digest, ParsedStatement.Prepared> entry = iterator.next();
+                if (shouldInvalidate(ksName, cfName, entry.getValue().statement))
+                {
+                    SystemKeyspace.removePreparedStatement(entry.getKey());
+                    iterator.remove();
+                }
+            }
+        }
+
+        private static void removeInvalidPreparedStatements(Iterator<ParsedStatement.Prepared> iterator, String ksName, String cfName)
         {
             while (iterator.hasNext())
             {
@@ -567,7 +803,7 @@ public class QueryProcessor implements QueryHandler
             }
         }
 
-        private boolean shouldInvalidate(String ksName, String cfName, CQLStatement statement)
+        private static boolean shouldInvalidate(String ksName, String cfName, CQLStatement statement)
         {
             String statementKsName;
             String statementCfName;
@@ -617,53 +853,54 @@ public class QueryProcessor implements QueryHandler
             // in case there are other overloads, we have to remove all overloads since argument type
             // matching may change (due to type casting)
             if (Schema.instance.getKSMetaData(ksName).functions.get(new FunctionName(ksName, functionName)).size() > 1)
-            {
-                removeInvalidPreparedStatementsForFunction(preparedStatements.values().iterator(), ksName, functionName);
-                removeInvalidPreparedStatementsForFunction(thriftPreparedStatements.values().iterator(), ksName, functionName);
-            }
+                removeInvalidPreparedStatementsForFunction(ksName, functionName);
         }
 
-        public void onUpdateColumnFamily(String ksName, String cfName, boolean columnsDidChange)
+        public void onUpdateColumnFamily(String ksName, String cfName, boolean affectsStatements)
         {
-            logger.info("Column definitions for {}.{} changed, invalidating related prepared statements", ksName, cfName);
-            if (columnsDidChange)
+            logger.trace("Column definitions for {}.{} changed, invalidating related prepared statements", ksName, cfName);
+            if (affectsStatements)
                 removeInvalidPreparedStatements(ksName, cfName);
+        }
+
+        public void onUpdateFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
+        {
+            // Updating a function may imply we've changed the body of the function, so we need to invalid statements so that
+            // the new definition is picked (the function is resolved at preparation time).
+            // TODO: if the function has multiple overload, we could invalidate only the statement refering to the overload
+            // that was updated. This requires a few changes however and probably doesn't matter much in practice.
+            removeInvalidPreparedStatementsForFunction(ksName, functionName);
+        }
+
+        public void onUpdateAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
+        {
+            // Updating a function may imply we've changed the body of the function, so we need to invalid statements so that
+            // the new definition is picked (the function is resolved at preparation time).
+            // TODO: if the function has multiple overload, we could invalidate only the statement refering to the overload
+            // that was updated. This requires a few changes however and probably doesn't matter much in practice.
+            removeInvalidPreparedStatementsForFunction(ksName, aggregateName);
         }
 
         public void onDropKeyspace(String ksName)
         {
-            logger.info("Keyspace {} was dropped, invalidating related prepared statements", ksName);
+            logger.trace("Keyspace {} was dropped, invalidating related prepared statements", ksName);
             removeInvalidPreparedStatements(ksName, null);
         }
 
         public void onDropColumnFamily(String ksName, String cfName)
         {
-            logger.info("Table {}.{} was dropped, invalidating related prepared statements", ksName, cfName);
+            logger.trace("Table {}.{} was dropped, invalidating related prepared statements", ksName, cfName);
             removeInvalidPreparedStatements(ksName, cfName);
         }
 
         public void onDropFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
         {
-            onDropFunctionInternal(ksName, functionName, argTypes);
+            removeInvalidPreparedStatementsForFunction(ksName, functionName);
         }
 
         public void onDropAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
         {
-            onDropFunctionInternal(ksName, aggregateName, argTypes);
-        }
-
-        private static void onDropFunctionInternal(String ksName, String functionName, List<AbstractType<?>> argTypes)
-        {
-            removeInvalidPreparedStatementsForFunction(preparedStatements.values().iterator(), ksName, functionName);
-            removeInvalidPreparedStatementsForFunction(thriftPreparedStatements.values().iterator(), ksName, functionName);
-        }
-
-        private static void removeInvalidPreparedStatementsForFunction(Iterator<ParsedStatement.Prepared> statements,
-                                                                       final String ksName,
-                                                                       final String functionName)
-        {
-            Predicate<Function> matchesFunction = f -> ksName.equals(f.name().keyspace) && functionName.equals(f.name().name);
-            Iterators.removeIf(statements, statement -> Iterables.any(statement.statement.getFunctions(), matchesFunction));
+            removeInvalidPreparedStatementsForFunction(ksName, aggregateName);
         }
     }
 }

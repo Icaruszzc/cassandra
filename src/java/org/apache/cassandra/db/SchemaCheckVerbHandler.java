@@ -35,8 +35,15 @@ public class SchemaCheckVerbHandler implements IVerbHandler
 
     public void doVerb(MessageIn message, int id)
     {
-        logger.debug("Received schema check request.");
-        MessageOut<UUID> response = new MessageOut<UUID>(MessagingService.Verb.INTERNAL_RESPONSE, Schema.instance.getVersion(), UUIDSerializer.serializer);
+        logger.trace("Received schema check request.");
+
+        /*
+        3.11 is special here: We return the 3.0 compatible version, if the requesting node
+        is running 3.0. Otherwise the "real" schema version.
+        */
+        MessageOut<UUID> response = new MessageOut<>(MessagingService.Verb.INTERNAL_RESPONSE,
+                                                     Schema.instance.getVersion(),
+                                                     UUIDSerializer.serializer);
         MessagingService.instance().sendReply(response, id, message.from);
     }
 }

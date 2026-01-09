@@ -28,10 +28,11 @@ import java.util.concurrent.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.hadoop.ConfigHelper;
 import org.apache.cassandra.hadoop.HadoopCompat;
@@ -67,6 +68,7 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
     public final static String BUFFER_SIZE_IN_MB = "mapreduce.output.bulkoutputformat.buffersize";
     public final static String STREAM_THROTTLE_MBITS = "mapreduce.output.bulkoutputformat.streamthrottlembits";
     public final static String MAX_FAILED_HOSTS = "mapreduce.output.bulkoutputformat.maxfailedhosts";
+    public final static String IGNORE_HOSTS = "mapreduce.output.bulkoutputformat.ignorehosts";
 
     private final Logger logger = LoggerFactory.getLogger(CqlBulkRecordWriter.class);
 
@@ -77,6 +79,7 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
     protected SSTableLoader loader;
     protected Progressable progress;
     protected TaskAttemptContext context;
+    protected final Set<InetAddress> ignores = new HashSet<>();
 
     private String keyspace;
     private String table;
@@ -84,6 +87,7 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
     private String insertStatement;
     private File outputDir;
     private boolean deleteSrc;
+    private IPartitioner partitioner;
 
     CqlBulkRecordWriter(TaskAttemptContext context) throws IOException
     {
@@ -101,7 +105,6 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
 
     CqlBulkRecordWriter(Configuration conf) throws IOException
     {
-        Config.setOutboundBindAny(true);
         this.conf = conf;
         DatabaseDescriptor.setStreamThroughputOutboundMegabitsPerSec(Integer.parseInt(conf.get(STREAM_THROTTLE_MBITS, "0")));
         maxFailures = Integer.parseInt(conf.get(MAX_FAILED_HOSTS, "0"));
@@ -124,6 +127,23 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
         insertStatement = CqlBulkOutputFormat.getTableInsertStatement(conf, table);
         outputDir = getTableDirectory();
         deleteSrc = CqlBulkOutputFormat.getDeleteSourceOnSuccess(conf);
+        try
+        {
+            partitioner = ConfigHelper.getInputPartitioner(conf);
+        }
+        catch (Exception e)
+        {
+            partitioner = Murmur3Partitioner.instance;
+        }
+        try
+        {
+            for (String hostToIgnore : CqlBulkOutputFormat.getIgnoreHosts(conf))
+                ignores.add(InetAddress.getByName(hostToIgnore));
+        }
+        catch (UnknownHostException e)
+        {
+            throw new RuntimeException(("Unknown host: " + e.getMessage()));
+        }
     }
 
     protected String getOutputLocation() throws IOException
@@ -144,6 +164,7 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
                                      .withPartitioner(ConfigHelper.getOutputPartitioner(conf))
                                      .inDirectory(outputDir)
                                      .withBufferSizeInMB(Integer.parseInt(conf.get(BUFFER_SIZE_IN_MB, "64")))
+                                     .withPartitioner(partitioner)
                                      .build();
         }
 
@@ -227,7 +248,7 @@ public class CqlBulkRecordWriter extends RecordWriter<Object, List<ByteBuffer>>
         if (writer != null)
         {
             writer.close();
-            Future<StreamState> future = loader.stream();
+            Future<StreamState> future = loader.stream(ignores);
             while (true)
             {
                 try

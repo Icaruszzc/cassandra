@@ -26,6 +26,7 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -37,6 +38,7 @@ public class PartitionerDefinedOrder extends AbstractType<ByteBuffer>
 
     public PartitionerDefinedOrder(IPartitioner partitioner)
     {
+        super(ComparisonType.CUSTOM);
         this.partitioner = partitioner;
     }
 
@@ -81,12 +83,12 @@ public class PartitionerDefinedOrder extends AbstractType<ByteBuffer>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         throw new UnsupportedOperationException();
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         // o1 and o2 can be empty so we need to use PartitionPosition, not DecoratedKey
         return PartitionPosition.ForKey.get(o1, partitioner).compareTo(PartitionPosition.ForKey.get(o2, partitioner));

@@ -39,7 +39,7 @@ public class NoSpamLoggerTest
 {
     Map<Level, Queue<Pair<String, Object[]>>> logged = new HashMap<>();
 
-   Logger mock = new SubstituteLogger(null)
+   Logger mock = new SubstituteLogger(null, null, true)
    {
 
        @Override
@@ -126,6 +126,14 @@ public class NoSpamLoggerTest
        assertTrue(NoSpamLogger.log( mock, l, 5,  TimeUnit.NANOSECONDS, statement, param));
 
        assertEquals(2, logged.get(l).size());
+
+       assertTrue(NoSpamLogger.log( mock, l, "key", 5,  TimeUnit.NANOSECONDS, statement, param));
+
+       assertEquals(3, logged.get(l).size());
+
+       assertFalse(NoSpamLogger.log( mock, l, "key", 5,  TimeUnit.NANOSECONDS, statement, param));
+
+       assertEquals(3, logged.get(l).size());
    }
 
    private void assertLoggedSizes(int info, int warn, int error)

@@ -25,6 +25,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,32 +48,40 @@ final class HintsStore
 
     public final UUID hostId;
     private final File hintsDirectory;
+    private final ImmutableMap<String, Object> writerParams;
 
-    private final Map<HintsDescriptor, Long> dispatchOffsets;
+    private final Map<HintsDescriptor, InputPosition> dispatchPositions;
     private final Deque<HintsDescriptor> dispatchDequeue;
-    private final Queue<HintsDescriptor> blacklistedFiles;
+    private final Queue<HintsDescriptor> corruptedFiles;
 
     // last timestamp used in a descriptor; make sure to not reuse the same timestamp for new descriptors.
     private volatile long lastUsedTimestamp;
     private volatile HintsWriter hintsWriter;
 
-    private HintsStore(UUID hostId, File hintsDirectory, List<HintsDescriptor> descriptors)
+    private HintsStore(UUID hostId, File hintsDirectory, ImmutableMap<String, Object> writerParams, List<HintsDescriptor> descriptors)
     {
         this.hostId = hostId;
         this.hintsDirectory = hintsDirectory;
+        this.writerParams = writerParams;
 
-        dispatchOffsets = new ConcurrentHashMap<>();
+        dispatchPositions = new ConcurrentHashMap<>();
         dispatchDequeue = new ConcurrentLinkedDeque<>(descriptors);
-        blacklistedFiles = new ConcurrentLinkedQueue<>();
+        corruptedFiles = new ConcurrentLinkedQueue<>();
 
         //noinspection resource
         lastUsedTimestamp = descriptors.stream().mapToLong(d -> d.timestamp).max().orElse(0L);
     }
 
-    static HintsStore create(UUID hostId, File hintsDirectory, List<HintsDescriptor> descriptors)
+    static HintsStore create(UUID hostId, File hintsDirectory, ImmutableMap<String, Object> writerParams, List<HintsDescriptor> descriptors)
     {
         descriptors.sort((d1, d2) -> Long.compare(d1.timestamp, d2.timestamp));
-        return new HintsStore(hostId, hintsDirectory, descriptors);
+        return new HintsStore(hostId, hintsDirectory, writerParams, descriptors);
+    }
+
+    @VisibleForTesting
+    int getDispatchQueueSize()
+    {
+        return dispatchDequeue.size();
     }
 
     InetAddress address()
@@ -109,14 +119,14 @@ final class HintsStore
             delete(descriptor);
         }
 
-        while ((descriptor = blacklistedFiles.poll()) != null)
+        while ((descriptor = corruptedFiles.poll()) != null)
         {
             cleanUp(descriptor);
             delete(descriptor);
         }
     }
 
-    private void delete(HintsDescriptor descriptor)
+    void delete(HintsDescriptor descriptor)
     {
         File hintsFile = new File(hintsDirectory, descriptor.fileName());
         if (hintsFile.delete())
@@ -133,24 +143,24 @@ final class HintsStore
         return !dispatchDequeue.isEmpty();
     }
 
-    Optional<Long> getDispatchOffset(HintsDescriptor descriptor)
+    InputPosition getDispatchOffset(HintsDescriptor descriptor)
     {
-        return Optional.ofNullable(dispatchOffsets.get(descriptor));
+        return dispatchPositions.get(descriptor);
     }
 
-    void markDispatchOffset(HintsDescriptor descriptor, long mark)
+    void markDispatchOffset(HintsDescriptor descriptor, InputPosition inputPosition)
     {
-        dispatchOffsets.put(descriptor, mark);
+        dispatchPositions.put(descriptor, inputPosition);
     }
 
     void cleanUp(HintsDescriptor descriptor)
     {
-        dispatchOffsets.remove(descriptor);
+        dispatchPositions.remove(descriptor);
     }
 
-    void blacklist(HintsDescriptor descriptor)
+    void markCorrupted(HintsDescriptor descriptor)
     {
-        blacklistedFiles.add(descriptor);
+        corruptedFiles.add(descriptor);
     }
 
     /*
@@ -179,7 +189,7 @@ final class HintsStore
     private HintsWriter openWriter()
     {
         lastUsedTimestamp = Math.max(System.currentTimeMillis(), lastUsedTimestamp + 1);
-        HintsDescriptor descriptor = new HintsDescriptor(hostId, lastUsedTimestamp);
+        HintsDescriptor descriptor = new HintsDescriptor(hostId, lastUsedTimestamp, writerParams);
 
         try
         {

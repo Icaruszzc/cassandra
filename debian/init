@@ -1,4 +1,20 @@
 #! /bin/sh
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 ### BEGIN INIT INFO
 # Provides:          cassandra
 # Required-Start:    $remote_fs $network $named $time
@@ -21,6 +37,7 @@ SCRIPTNAME=/etc/init.d/$NAME
 CONFDIR=/etc/cassandra
 WAIT_FOR_START=10
 CASSANDRA_HOME=/usr/share/cassandra
+CASSANDRA_CONF=$CONFDIR
 FD_LIMIT=100000
 
 [ -e /usr/share/cassandra/apache-cassandra.jar ] || exit 0
@@ -29,16 +46,6 @@ FD_LIMIT=100000
 
 # Read configuration variable file if it is present
 [ -r /etc/default/$NAME ] && . /etc/default/$NAME
-
-# Read Cassandra environment file.
-. /etc/cassandra/cassandra-env.sh
-
-if [ -z "$JVM_OPTS" ]; then
-    echo "Initialization failed; \$JVM_OPTS not set!" >&2
-    exit 3
-fi
-
-export JVM_OPTS
 
 # Export JAVA_HOME, if set.
 [ -n "$JAVA_HOME" ] && export JAVA_HOME
@@ -57,7 +64,7 @@ export JVM_OPTS
 # process is not running but the pidfile exists (to match the exit codes for
 # the "status" command; see LSB core spec 3.1, section 20.2)
 #
-CMD_PATT="cassandra.+CassandraDaemon"
+CMD_PATT="Dcassandra-pidfile=.*cassandra\.pid"
 is_running()
 {
     if [ -f $PIDFILE ]; then
@@ -82,7 +89,11 @@ do_start()
     ulimit -n "$FD_LIMIT"
 
     cassandra_home=`getent passwd cassandra | awk -F ':' '{ print $6; }'`
-    heap_dump_f="$cassandra_home/java_`date +%s`.hprof"
+    if [ "x$CASSANDRA_HEAPDUMP_DIR" != "x" ]; then
+        heap_dump_f="$CASSANDRA_HEAPDUMP_DIR/java_`date +%s`.hprof"
+    else
+        heap_dump_f="$cassandra_home/java_`date +%s`.hprof"
+    fi
     error_log_f="$cassandra_home/hs_err_`date +%s`.log"
 
     [ -e `dirname "$PIDFILE"` ] || \
@@ -107,7 +118,7 @@ do_stop()
     #   1 if daemon was already stopped
     #   2 if daemon could not be stopped
     #   other if a failure occurred
-    start-stop-daemon -K -p "$PIDFILE" -R TERM/30/KILL/5 >/dev/null
+    start-stop-daemon -K -u cassandra -p "$PIDFILE" -R TERM/30/KILL/5 >/dev/null
     RET=$?
     rm -f "$PIDFILE"
     return $RET

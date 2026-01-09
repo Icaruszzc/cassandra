@@ -19,16 +19,23 @@ package org.apache.cassandra.auth;
 
 import java.util.Set;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.exceptions.UnauthorizedException;
 
 public class Roles
 {
+    private static final Logger logger = LoggerFactory.getLogger(Roles.class);
+
     private static final RolesCache cache = new RolesCache(DatabaseDescriptor.getRoleManager());
 
     /**
      * Get all roles granted to the supplied Role, including both directly granted
      * and inherited roles.
-     * The returned roles may be cached if roles_validity_in_ms > 0
+     * The returned roles may be cached if {@code roles_validity_in_ms > 0}
      *
      * @param primaryRole the Role
      * @return set of all granted Roles for the primary Role
@@ -47,10 +54,18 @@ public class Roles
      */
     public static boolean hasSuperuserStatus(RoleResource role)
     {
-        IRoleManager roleManager = DatabaseDescriptor.getRoleManager();
-        for (RoleResource r : cache.getRoles(role))
-            if (roleManager.isSuper(r))
-                return true;
-        return false;
+        try
+        {
+            IRoleManager roleManager = DatabaseDescriptor.getRoleManager();
+            for (RoleResource r : cache.getRoles(role))
+                if (roleManager.isSuper(r))
+                    return true;
+            return false;
+        }
+        catch (RequestExecutionException e)
+        {
+            logger.debug("Failed to authorize {} for super-user permission", role.getRoleName());
+            throw new UnauthorizedException("Unable to perform authorization of super-user permission: " + e.getMessage(), e);
+        }
     }
 }

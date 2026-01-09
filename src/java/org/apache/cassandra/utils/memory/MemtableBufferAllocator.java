@@ -19,7 +19,6 @@ package org.apache.cassandra.utils.memory;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -31,10 +30,9 @@ public abstract class MemtableBufferAllocator extends MemtableAllocator
         super(onHeap, offHeap);
     }
 
-    public Row.Builder rowBuilder(CFMetaData metadata, OpOrder.Group writeOp, boolean isStatic)
+    public Row.Builder rowBuilder(OpOrder.Group writeOp)
     {
-        Columns columns = isStatic ? metadata.partitionColumns().statics : metadata.partitionColumns().regulars;
-        return allocator(writeOp).cloningBTreeRowBuilder(columns);
+        return allocator(writeOp).cloningBTreeRowBuilder();
     }
 
     public DecoratedKey clone(DecoratedKey key, OpOrder.Group writeOp)

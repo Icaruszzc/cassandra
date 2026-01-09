@@ -17,6 +17,8 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
+import java.io.PrintStream;
+
 import static java.lang.String.format;
 import io.airlift.command.Command;
 
@@ -29,24 +31,31 @@ public class ProxyHistograms extends NodeToolCmd
     @Override
     public void execute(NodeProbe probe)
     {
-        String[] percentiles = new String[]{"50%", "75%", "95%", "98%", "99%", "Min", "Max"};
+        PrintStream out = probe.output().out;
+        String[] percentiles = {"50%", "75%", "95%", "98%", "99%", "Min", "Max"};
         double[] readLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("Read"));
         double[] writeLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("Write"));
         double[] rangeLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("RangeSlice"));
+        double[] casReadLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("CASRead"));
+        double[] casWriteLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("CASWrite"));
+        double[] viewWriteLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("ViewWrite"));
 
-        System.out.println("proxy histograms");
-        System.out.println(format("%-10s%18s%18s%18s",
-                "Percentile", "Read Latency", "Write Latency", "Range Latency"));
-        System.out.println(format("%-10s%18s%18s%18s",
-                "", "(micros)", "(micros)", "(micros)"));
+        out.println("proxy histograms");
+        out.println(format("%-10s%19s%19s%19s%19s%19s%19s",
+                "Percentile", "Read Latency", "Write Latency", "Range Latency", "CAS Read Latency", "CAS Write Latency", "View Write Latency"));
+        out.println(format("%-10s%19s%19s%19s%19s%19s%19s",
+                "", "(micros)", "(micros)", "(micros)", "(micros)", "(micros)", "(micros)"));
         for (int i = 0; i < percentiles.length; i++)
         {
-            System.out.println(format("%-10s%18.2f%18.2f%18.2f",
-                    percentiles[i],
-                    readLatency[i],
-                    writeLatency[i],
-                    rangeLatency[i]));
+            out.println(format("%-10s%19.2f%19.2f%19.2f%19.2f%19.2f%19.2f",
+                               percentiles[i],
+                               readLatency[i],
+                               writeLatency[i],
+                               rangeLatency[i],
+                               casReadLatency[i],
+                               casWriteLatency[i],
+                               viewWriteLatency[i]));
         }
-        System.out.println();
+        out.println();
     }
 }

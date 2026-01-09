@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -47,6 +47,8 @@ public class StandaloneVerifier
     public static void main(String args[])
     {
         Options options = Options.parseArgs(args);
+        Util.initDatabaseDescriptor();
+
         try
         {
             // load keyspace descriptions.
@@ -93,23 +95,14 @@ public class StandaloneVerifier
 
             for (SSTableReader sstable : sstables)
             {
-                try
+                try (Verifier verifier = new Verifier(cfs, sstable, handler, true))
                 {
-
-                    try (Verifier verifier = new Verifier(cfs, sstable, handler, true))
-                    {
-                        verifier.verify(extended);
-                    }
-                    catch (CorruptSSTableException cs)
-                    {
-                        System.err.println(String.format("Error verifying %s: %s", sstable, cs.getMessage()));
-                        hasFailed = true;
-                    }
+                    verifier.verify(extended);
                 }
                 catch (Exception e)
                 {
-                    System.err.println(String.format("Error verifying %s: %s", sstable, e.getMessage()));
-                    e.printStackTrace(System.err);
+                    handler.warn(String.format("Error verifying %s: %s", sstable, e.getMessage()), e);
+                    hasFailed = true;
                 }
             }
 

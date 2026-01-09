@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Throwables;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.Row;
@@ -63,7 +64,7 @@ class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter
     {
         super(directory, metadata, columns);
         this.bufferSize = bufferSizeInMB * 1024L * 1024L;
-        this.header = new SerializationHeader(metadata, columns, EncodingStats.NO_STATS);
+        this.header = new SerializationHeader(true, metadata, columns, EncodingStats.NO_STATS);
         diskWriter.start();
     }
 
@@ -89,7 +90,7 @@ class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter
         // improve that. In particular, what we count is closer to the serialized value, but it's debatable that it's the right thing
         // to count since it will take a lot more space in memory and the bufferSize if first and foremost used to avoid OOM when
         // using this writer.
-        currentSize += UnfilteredSerializer.serializer.serializedSize(row, header, formatType.info.getLatestVersion().correspondingMessagingVersion());
+        currentSize += UnfilteredSerializer.serializer.serializedSize(row, header, 0, formatType.info.getLatestVersion().correspondingMessagingVersion());
     }
 
     private void maybeSync() throws SyncException
@@ -189,7 +190,7 @@ class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter
     //// typedef
     static class Buffer extends TreeMap<DecoratedKey, PartitionUpdate> {}
 
-    private class DiskWriter extends Thread
+    private class DiskWriter extends FastThreadLocalThread
     {
         volatile Throwable exception = null;
 

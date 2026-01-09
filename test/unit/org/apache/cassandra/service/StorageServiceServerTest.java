@@ -24,10 +24,18 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.InetAddress;
-import java.util.*;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.UUID;
 
 import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Multimap;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -35,8 +43,8 @@ import org.junit.runner.RunWith;
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.WindowsFailedSnapshotTracker;
 import org.apache.cassandra.dht.Murmur3Partitioner;
@@ -48,13 +56,16 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.PropertyFileSnitch;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.ReplicationParams;
-import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.schema.SchemaKeyspaceTables;
 import org.apache.cassandra.utils.FBUtilities;
+import org.mockito.Mockito;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
 @RunWith(OrderedJUnit4ClassRunner.class)
@@ -63,6 +74,7 @@ public class StorageServiceServerTest
     @BeforeClass
     public static void setUp() throws ConfigurationException
     {
+        DatabaseDescriptor.daemonInitialization();
         IEndpointSnitch snitch = new PropertyFileSnitch();
         DatabaseDescriptor.setEndpointSnitch(snitch);
         Keyspace.setInitialized();
@@ -94,10 +106,10 @@ public class StorageServiceServerTest
     }
 
     @Test
-    public void testSnapshot() throws IOException
+    public void testSnapshotWithFlush() throws IOException
     {
         // no need to insert extra data, even an "empty" database will have a little information in the system keyspace
-        StorageService.instance.takeSnapshot("snapshot");
+        StorageService.instance.takeSnapshot(UUID.randomUUID().toString());
     }
 
     private void checkTempFilePresence(File f, boolean exist)
@@ -117,7 +129,7 @@ public class StorageServiceServerTest
     @Test
     public void testSnapshotFailureHandler() throws IOException
     {
-        assumeTrue(FBUtilities.isWindows());
+        assumeTrue(FBUtilities.isWindows);
 
         // Initial "run" of Cassandra, nothing in failed snapshot file
         WindowsFailedSnapshotTracker.deleteOldSnapshots();
@@ -173,7 +185,14 @@ public class StorageServiceServerTest
     public void testTableSnapshot() throws IOException
     {
         // no need to insert extra data, even an "empty" database will have a little information in the system keyspace
-        StorageService.instance.takeTableSnapshot(SchemaKeyspace.NAME, SchemaKeyspace.KEYSPACES, "cf_snapshot");
+        StorageService.instance.takeTableSnapshot(SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspaceTables.KEYSPACES, UUID.randomUUID().toString());
+    }
+
+    @Test
+    public void testSnapshot() throws IOException
+    {
+        // no need to insert extra data, even an "empty" database will have a little information in the system keyspace
+        StorageService.instance.takeSnapshot(UUID.randomUUID().toString(), SchemaConstants.SCHEMA_KEYSPACE_NAME);
     }
 
     @Test
@@ -582,5 +601,58 @@ public class StorageServiceServerTest
 
         repairRangeFrom = StorageService.instance.createRepairRangeFrom("2000", "2000");
         assert repairRangeFrom.size() == 0;
+    }
+
+    @Test
+    public void testRebuildFailOnNonExistingDatacenter() throws Exception
+    {
+        String nonExistentDC = "NON_EXISTENT_DC";
+
+        try
+        {
+            getStorageService().rebuild(nonExistentDC, "StorageServiceServerTest", null, null);
+            fail();
+        }
+        catch (IllegalArgumentException ex)
+        {
+            assertEquals(String.format("Provided datacenter '%s' is not a valid datacenter, available datacenters are: %s",
+                                       nonExistentDC,
+                                       "datacenter1"),
+                         ex.getMessage());
+        }
+    }
+
+    @Test
+    public void testRebuildingWithTokensWithoutKeyspace() throws Exception
+    {
+        try
+        {
+            getStorageService().rebuild("datacenter1", null, "123", null);
+            fail();
+        }
+        catch (IllegalArgumentException ex)
+        {
+            assertEquals("Cannot specify tokens without keyspace.", ex.getMessage());
+        }
+    }
+
+    private StorageService getStorageService() throws Exception
+    {
+        ImmutableMultimap.Builder<String, InetAddress> builder = ImmutableMultimap.builder();
+        builder.put("datacenter1", InetAddress.getByName("127.0.0.1"));
+
+        TokenMetadata.Topology tokenMetadataTopology = Mockito.mock(TokenMetadata.Topology.class);
+        Mockito.when(tokenMetadataTopology.getDatacenterEndpoints()).thenReturn(builder.build());
+
+        TokenMetadata metadata = new TokenMetadata();
+        TokenMetadata spiedMetadata = Mockito.spy(metadata);
+
+        Mockito.when(spiedMetadata.getTopology()).thenReturn(tokenMetadataTopology);
+
+        StorageService spiedStorageService = Mockito.spy(StorageService.instance);
+        Mockito.when(spiedStorageService.getTokenMetadata()).thenReturn(spiedMetadata);
+        Mockito.when(spiedMetadata.cloneOnlyTokenMap()).thenReturn(spiedMetadata);
+
+        return spiedStorageService;
     }
 }

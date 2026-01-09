@@ -1,3 +1,20 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
                              CQL BINARY PROTOCOL v3
 
@@ -65,7 +82,7 @@ Table of Contents
   Each frame contains a fixed size header (9 bytes) followed by a variable size
   body. The header is described in Section 2. The content of the body depends
   on the header opcode value (the body can in particular be empty for some
-  opcode values). The list of allowed opcode is defined Section 2.3 and the
+  opcode values). The list of allowed opcode is defined Section 2.4 and the
   details of each corresponding message is described Section 4.
 
   The protocol distinguishes 2 types of frames: requests and responses. Requests
@@ -394,7 +411,11 @@ Table of Contents
               will still override this timestamp. This is entirely optional.
         0x40: With names for values. If set, then all values for all <query_i> must be
               preceded by a [string] <name_i> that have the same meaning as in QUERY
-              requests.
+              requests [IMPORTANT NOTE: this feature does not work and should not be
+              used. It is specified in a way that makes it impossible for the server
+              to implement. This will be fixed in a future version of the native
+              protocol. See https://issues.apache.org/jira/browse/CASSANDRA-10246 for
+              more details].
     - <n> is a [short] indicating the number of following queries.
     - <query_1>...<query_n> are the queries to execute. A <query_i> must be of the
       form:
@@ -917,6 +938,9 @@ Table of Contents
     <result_page_size> results. While the current implementation always respect
     the exact value of <result_page_size>, we reserve ourselves the right to return
     slightly smaller or bigger pages in the future for performance reasons.
+  - The <paging_state> is specific to a protocol version and drivers should not
+    send a <paging_state> returned by a node using the protocol v3 to query a node
+    using the protocol v4 for instance.
 
 
 9. Error codes
@@ -972,6 +996,7 @@ Table of Contents
                              - "BATCH_LOG": the timeout occured during the
                                write to the batch log when a (logged) batch
                                write was requested.
+                             - "CAS": the timeout occured during the Compare And Set write/update.
     0x1200    Read_timeout: Timeout exception during a read request. The rest
               of the ERROR message body will be
                 <cl><received><blockfor><data_present>
@@ -1023,9 +1048,10 @@ Table of Contents
   * QUERY, EXECUTE and BATCH messages can now optionally provide the default timestamp for the query.
     As this feature is optionally enabled by clients, implementing it is at the discretion of the
     client.
-  * QUERY, EXECUTE and BATCH messages can now optionally provide the names for the values of the
+  * QUERY and EXECUTE messages can now optionally provide the names for the values of the
     query. As this feature is optionally enabled by clients, implementing it is at the discretion of the
-    client.
+    client (Note that while the BATCH message has a flag for this, it actually doesn't work for BATCH,
+    see Section 4.1.7 for details).
   * The format of "Schema_change" results (Section 4.2.5.5) and "SCHEMA_CHANGE" events (Section 4.2.6)
     has been modified, and now includes changes related to user types.
 

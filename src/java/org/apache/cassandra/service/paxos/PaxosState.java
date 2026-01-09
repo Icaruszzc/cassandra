@@ -20,7 +20,6 @@
  */
 package org.apache.cassandra.service.paxos;
 
-import java.nio.ByteBuffer;
 import java.util.concurrent.locks.Lock;
 
 import com.google.common.util.concurrent.Striped;
@@ -63,7 +62,13 @@ public class PaxosState
             lock.lock();
             try
             {
-                PaxosState state = SystemKeyspace.loadPaxosState(toPrepare.update.partitionKey(), toPrepare.update.metadata());
+                // When preparing, we need to use the same time as "now" (that's the time we use to decide if something
+                // is expired or not) accross nodes otherwise we may have a window where a Most Recent Commit shows up
+                // on some replica and not others during a new proposal (in StorageProxy.beginAndRepairPaxos()), and no
+                // amount of re-submit will fix this (because the node on which the commit has expired will have a
+                // tombstone that hides any re-submit). See CASSANDRA-12043 for details.
+                int nowInSec = UUIDGen.unixTimestampInSec(toPrepare.ballot);
+                PaxosState state = SystemKeyspace.loadPaxosState(toPrepare.update.partitionKey(), toPrepare.update.metadata(), nowInSec);
                 if (toPrepare.isAfter(state.promised))
                 {
                     Tracing.trace("Promising ballot {}", toPrepare.ballot);
@@ -98,7 +103,8 @@ public class PaxosState
             lock.lock();
             try
             {
-                PaxosState state = SystemKeyspace.loadPaxosState(proposal.update.partitionKey(), proposal.update.metadata());
+                int nowInSec = UUIDGen.unixTimestampInSec(proposal.ballot);
+                PaxosState state = SystemKeyspace.loadPaxosState(proposal.update.partitionKey(), proposal.update.metadata(), nowInSec);
                 if (proposal.hasBallot(state.promised.ballot) || proposal.isAfter(state.promised))
                 {
                     Tracing.trace("Accepting proposal {}", proposal);

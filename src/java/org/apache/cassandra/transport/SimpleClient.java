@@ -35,11 +35,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.util.internal.logging.Slf4JLoggerFactory;
 import org.apache.cassandra.cql3.QueryOptions;
@@ -75,7 +80,7 @@ public class SimpleClient implements Closeable
 
     protected final ResponseHandler responseHandler = new ResponseHandler();
     protected final Connection.Tracker tracker = new ConnectionTracker();
-    protected final int version;
+    protected final ProtocolVersion version;
     // We don't track connection really, so we don't need one Connection per channel
     protected Connection connection;
     protected Bootstrap bootstrap;
@@ -84,28 +89,36 @@ public class SimpleClient implements Closeable
 
     private final Connection.Factory connectionFactory = new Connection.Factory()
     {
-        public Connection newConnection(Channel channel, int version)
+        public Connection newConnection(Channel channel, ProtocolVersion version)
         {
             return connection;
         }
     };
 
-    public SimpleClient(String host, int port, int version, ClientEncryptionOptions encryptionOptions)
+    public SimpleClient(String host, int port, ProtocolVersion version, ClientEncryptionOptions encryptionOptions)
     {
-        this.host = host;
-        this.port = port;
-        this.version = version;
-        this.encryptionOptions = encryptionOptions;
+        this(host, port, version, false, encryptionOptions);
     }
 
     public SimpleClient(String host, int port, ClientEncryptionOptions encryptionOptions)
     {
-        this(host, port, Server.CURRENT_VERSION, encryptionOptions);
+        this(host, port, ProtocolVersion.CURRENT, encryptionOptions);
     }
 
-    public SimpleClient(String host, int port, int version)
+    public SimpleClient(String host, int port, ProtocolVersion version)
     {
         this(host, port, version, new ClientEncryptionOptions());
+    }
+
+    public SimpleClient(String host, int port, ProtocolVersion version, boolean useBeta, ClientEncryptionOptions encryptionOptions)
+    {
+        this.host = host;
+        this.port = port;
+        if (version.isBeta() && !useBeta)
+            throw new IllegalArgumentException(String.format("Beta version of server used (%s), but USE_BETA flag is not set", version));
+
+        this.version = version;
+        this.encryptionOptions = encryptionOptions;
     }
 
     public SimpleClient(String host, int port)
@@ -115,10 +128,20 @@ public class SimpleClient implements Closeable
 
     public void connect(boolean useCompression) throws IOException
     {
+        connect(useCompression, false);
+    }
+
+    public void connect(boolean useCompression, boolean throwOnOverload) throws IOException
+    {
         establishConnection();
 
         Map<String, String> options = new HashMap<>();
         options.put(StartupMessage.CQL_VERSION, "3.0.0");
+
+        if (throwOnOverload)
+            options.put(StartupMessage.THROW_ON_OVERLOAD, "1");
+        connection.setThrowOnOverload(throwOnOverload);
+
         if (useCompression)
         {
             options.put(StartupMessage.COMPRESSION, "snappy");
@@ -241,7 +264,7 @@ public class SimpleClient implements Closeable
 
     // Stateless handlers
     private static final Message.ProtocolDecoder messageDecoder = new Message.ProtocolDecoder();
-    private static final Message.ProtocolEncoder messageEncoder = new Message.ProtocolEncoder();
+    private static final Message.ProtocolEncoder messageEncoder = new Message.ProtocolEncoder(ProtocolVersionLimit.SERVER_DEFAULT);
     private static final Frame.Decompressor frameDecompressor = new Frame.Decompressor();
     private static final Frame.Compressor frameCompressor = new Frame.Compressor();
     private static final Frame.Encoder frameEncoder = new Frame.Encoder();
@@ -264,7 +287,7 @@ public class SimpleClient implements Closeable
             channel.attr(Connection.attributeKey).set(connection);
 
             ChannelPipeline pipeline = channel.pipeline();
-            pipeline.addLast("frameDecoder", new Frame.Decoder(connectionFactory));
+            pipeline.addLast("frameDecoder", new Frame.Decoder(connectionFactory, ProtocolVersionLimit.SERVER_DEFAULT));
             pipeline.addLast("frameEncoder", frameEncoder);
 
             pipeline.addLast("frameDecompressor", frameDecompressor);
@@ -291,14 +314,14 @@ public class SimpleClient implements Closeable
             super.initChannel(channel);
             SSLEngine sslEngine = sslContext.createSSLEngine();
             sslEngine.setUseClientMode(true);
-            sslEngine.setEnabledCipherSuites(encryptionOptions.cipher_suites);
-            sslEngine.setEnabledProtocols(SSLFactory.ACCEPTED_PROTOCOLS);
+            String[] suites = SSLFactory.filterCipherSuites(sslEngine.getSupportedCipherSuites(), encryptionOptions.cipher_suites);
+            sslEngine.setEnabledCipherSuites(suites);
             channel.pipeline().addFirst("ssl", new SslHandler(sslEngine));
         }
     }
 
     @ChannelHandler.Sharable
-    private static class ResponseHandler extends SimpleChannelInboundHandler<Message.Response>
+    static class ResponseHandler extends SimpleChannelInboundHandler<Message.Response>
     {
         public final BlockingQueue<Message.Response> responses = new SynchronousQueue<>(true);
         public EventHandler eventHandler;
@@ -322,11 +345,17 @@ public class SimpleClient implements Closeable
             }
         }
 
+        @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
         {
             if (this == ctx.pipeline().last())
+            {
                 logger.error("Exception in response", cause);
-            ctx.fireExceptionCaught(cause);
+            }
+            else
+            {
+                ctx.fireExceptionCaught(cause);
+            }
         }
     }
 }

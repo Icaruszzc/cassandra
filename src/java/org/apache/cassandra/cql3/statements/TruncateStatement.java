@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.io.IOException;
 import java.util.concurrent.TimeoutException;
 
 import org.apache.cassandra.auth.Permission;
@@ -45,7 +44,7 @@ public class TruncateStatement extends CFStatement implements CQLStatement
         return 0;
     }
 
-    public Prepared prepare() throws InvalidRequestException
+    public Prepared prepare(ClientState clientState) throws InvalidRequestException
     {
         return new Prepared(this);
     }
@@ -60,17 +59,17 @@ public class TruncateStatement extends CFStatement implements CQLStatement
         ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
     }
 
-    public ResultMessage execute(QueryState state, QueryOptions options) throws InvalidRequestException, TruncateException
+    public ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime) throws InvalidRequestException, TruncateException
     {
         try
         {
             CFMetaData metaData = Schema.instance.getCFMetaData(keyspace(), columnFamily());
-            if (metaData.isMaterializedView())
+            if (metaData.isView())
                 throw new InvalidRequestException("Cannot TRUNCATE materialized view directly; must truncate base table instead");
 
             StorageProxy.truncateBlocking(keyspace(), columnFamily());
         }
-        catch (UnavailableException | TimeoutException | IOException e)
+        catch (UnavailableException | TimeoutException e)
         {
             throw new TruncateException(e);
         }

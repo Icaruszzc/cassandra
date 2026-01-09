@@ -24,6 +24,8 @@ import java.util.UUID;
 
 import javax.annotation.Nullable;
 
+import com.google.common.primitives.Ints;
+
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.UnknownColumnFamilyException;
 import org.apache.cassandra.io.IVersionedSerializer;
@@ -31,7 +33,7 @@ import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.BytesReadTracker;
+import org.apache.cassandra.io.util.TrackedDataInputPlus;
 import org.apache.cassandra.utils.UUIDSerializer;
 
 /**
@@ -81,10 +83,10 @@ public final class HintMessage
     {
         public long serializedSize(HintMessage message, int version)
         {
-            int size = (int) UUIDSerializer.serializer.serializedSize(message.hostId, version);
+            long size = UUIDSerializer.serializer.serializedSize(message.hostId, version);
 
-            int hintSize = (int) Hint.serializer.serializedSize(message.hint, version);
-            size += TypeSizes.sizeof(hintSize);
+            long hintSize = Hint.serializer.serializedSize(message.hint, version);
+            size += TypeSizes.sizeofUnsignedVInt(hintSize);
             size += hintSize;
 
             return size;
@@ -100,7 +102,7 @@ public final class HintMessage
              * We are serializing the hint size so that the receiver of the message could gracefully handle
              * deserialize failure when a table had been dropped, by simply skipping the unread bytes.
              */
-            out.writeInt((int) Hint.serializer.serializedSize(message.hint, version));
+            out.writeUnsignedVInt(Hint.serializer.serializedSize(message.hint, version));
 
             Hint.serializer.serialize(message.hint, out, version);
         }
@@ -114,15 +116,15 @@ public final class HintMessage
         {
             UUID hostId = UUIDSerializer.serializer.deserialize(in, version);
 
-            int hintSize = in.readInt();
-            BytesReadTracker countingIn = new BytesReadTracker(in);
+            long hintSize = in.readUnsignedVInt();
+            TrackedDataInputPlus countingIn = new TrackedDataInputPlus(in);
             try
             {
                 return new HintMessage(hostId, Hint.serializer.deserialize(countingIn, version));
             }
             catch (UnknownColumnFamilyException e)
             {
-                in.skipBytes(hintSize - (int) countingIn.getBytesRead());
+                in.skipBytes(Ints.checkedCast(hintSize - countingIn.getBytesRead()));
                 return new HintMessage(hostId, e.cfId);
             }
         }

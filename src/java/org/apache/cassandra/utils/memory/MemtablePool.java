@@ -18,9 +18,19 @@
  */
 package org.apache.cassandra.utils.memory;
 
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Timer;
+import org.apache.cassandra.metrics.CassandraMetricsRegistry;
+import org.apache.cassandra.metrics.DefaultNameFactory;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
+import org.apache.cassandra.utils.ExecutorUtils;
 
 
 /**
@@ -35,15 +45,23 @@ public abstract class MemtablePool
     public final SubPool onHeap;
     public final SubPool offHeap;
 
+    public final Timer blockedOnAllocating;
+    public final Gauge<Long> numPendingTasks;
+
     final WaitQueue hasRoom = new WaitQueue();
 
-    MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, Runnable cleaner)
+    MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, MemtableCleaner cleaner)
     {
+        Preconditions.checkArgument(cleaner != null, "Cleaner should not be null");
+
         this.onHeap = getSubPool(maxOnHeapMemory, cleanThreshold);
         this.offHeap = getSubPool(maxOffHeapMemory, cleanThreshold);
         this.cleaner = getCleaner(cleaner);
-        if (this.cleaner != null)
-            this.cleaner.start();
+        this.cleaner.start();
+        DefaultNameFactory nameFactory = new DefaultNameFactory("MemtablePool");
+        blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(nameFactory.createMetricName("BlockedOnAllocation"));
+        numPendingTasks = CassandraMetricsRegistry.Metrics.register(nameFactory.createMetricName("PendingFlushTasks"),
+                                                                    () -> (long) this.cleaner.numPendingTasks());
     }
 
     SubPool getSubPool(long limit, float cleanThreshold)
@@ -51,13 +69,29 @@ public abstract class MemtablePool
         return new SubPool(limit, cleanThreshold);
     }
 
-    MemtableCleanerThread<?> getCleaner(Runnable cleaner)
+    MemtableCleanerThread<?> getCleaner(MemtableCleaner cleaner)
     {
         return cleaner == null ? null : new MemtableCleanerThread<>(this, cleaner);
     }
 
-    public abstract boolean needToCopyOnHeap();
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        ExecutorUtils.shutdownNowAndWait(timeout, unit, cleaner);
+    }
+
+
     public abstract MemtableAllocator newAllocator();
+
+    public boolean needsCleaning()
+    {
+        return onHeap.needsCleaning() || offHeap.needsCleaning();
+    }
+
+    public Long getNumPendingtasks()
+    {
+        return numPendingTasks.getValue();
+    }
 
     /**
      * Note the difference between acquire() and allocate(); allocate() makes more resources available to all owners,
@@ -150,7 +184,7 @@ public abstract class MemtablePool
             maybeClean();
         }
 
-        void acquired(long size)
+        void acquired()
         {
             maybeClean();
         }
@@ -184,6 +218,11 @@ public abstract class MemtablePool
             return allocated;
         }
 
+        public long getReclaiming()
+        {
+            return reclaiming;
+        }
+
         public float reclaimingRatio()
         {
             float r = reclaiming / (float) limit;
@@ -208,6 +247,11 @@ public abstract class MemtablePool
         public WaitQueue hasRoom()
         {
             return hasRoom;
+        }
+
+        public Timer.Context blockedTimerContext()
+        {
+            return blockedOnAllocating.time();
         }
     }
 

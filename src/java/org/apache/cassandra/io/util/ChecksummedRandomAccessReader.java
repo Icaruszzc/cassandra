@@ -19,95 +19,27 @@ package org.apache.cassandra.io.util;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.zip.CRC32;
 
-import org.apache.cassandra.io.compress.BufferType;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.ChecksumType;
 
-public class ChecksummedRandomAccessReader extends RandomAccessReader
+public final class ChecksummedRandomAccessReader
 {
-    @SuppressWarnings("serial")
-    public static class CorruptFileException extends RuntimeException
-    {
-        public final File file;
-
-        public CorruptFileException(Exception cause, File file)
-        {
-            super(cause);
-            this.file = file;
-        }
-    }
-
-    private final DataIntegrityMetadata.ChecksumValidator validator;
-    private final File file;
-
-    protected ChecksummedRandomAccessReader(File file, ChannelProxy channel, DataIntegrityMetadata.ChecksumValidator validator)
-    {
-        super(channel, validator.chunkSize, -1, BufferType.ON_HEAP);
-        this.validator = validator;
-        this.file = file;
-    }
-
-    @SuppressWarnings("resource")
-    public static ChecksummedRandomAccessReader open(File file, File crcFile) throws IOException
+    @SuppressWarnings("resource") // The Rebufferer owns both the channel and the validator and handles closing both.
+    public static RandomAccessReader open(File file, File crcFile) throws IOException
     {
         ChannelProxy channel = new ChannelProxy(file);
-        RandomAccessReader crcReader = RandomAccessReader.open(crcFile);
-        DataIntegrityMetadata.ChecksumValidator validator =
-            new DataIntegrityMetadata.ChecksumValidator(new CRC32(), crcReader, file.getPath());
-        return new ChecksummedRandomAccessReader(file, channel, validator);
-    }
-
-    @Override
-    protected void reBuffer()
-    {
-        long desiredPosition = current();
-        // align with buffer size, as checksums were computed in chunks of buffer size each.
-        bufferOffset = (desiredPosition / buffer.capacity()) * buffer.capacity();
-
-        buffer.clear();
-
-        long position = bufferOffset;
-        while (buffer.hasRemaining())
-        {
-            int n = channel.read(buffer, position);
-            if (n < 0)
-                break;
-            position += n;
-        }
-
-        buffer.flip();
-
         try
         {
-            validator.validate(ByteBufferUtil.getArray(buffer), 0, buffer.remaining());
+            DataIntegrityMetadata.ChecksumValidator validator = new DataIntegrityMetadata.ChecksumValidator(ChecksumType.CRC32,
+                                                                                                            RandomAccessReader.open(crcFile),
+                                                                                                            file.getPath());
+            Rebufferer rebufferer = new ChecksummedRebufferer(channel, validator);
+            return new RandomAccessReader.RandomAccessReaderWithOwnChannel(rebufferer);
         }
-        catch (IOException e)
-        {
-            throw new CorruptFileException(e, file);
-        }
-
-        buffer.position((int) (desiredPosition - bufferOffset));
-    }
-
-    @Override
-    public void seek(long newPosition)
-    {
-        validator.seek(newPosition);
-        super.seek(newPosition);
-    }
-
-    @Override
-    public void close()
-    {
-        try
-        {
-            super.close();
-        }
-        finally
+        catch (Throwable t)
         {
             channel.close();
-            validator.close();
+            throw t;
         }
     }
 }

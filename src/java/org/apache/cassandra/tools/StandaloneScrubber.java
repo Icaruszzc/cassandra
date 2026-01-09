@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,6 +19,7 @@
 package org.apache.cassandra.tools;
 
 import java.io.File;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -34,16 +35,22 @@ import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.compaction.*;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.db.lifecycle.TransactionLog;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.*;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.OutputHandler;
+import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.tools.BulkLoader.CmdLineOptions;
 
 public class StandaloneScrubber
 {
+    public static final String REINSERT_OVERFLOWED_TTL_OPTION_DESCRIPTION = "Rewrites rows with overflowed expiration date affected by CASSANDRA-14092 with " +
+                                                                            "the maximum supported expiration date of 2038-01-19T03:14:06+00:00. " +
+                                                                            "The rows are rewritten with the original timestamp incremented by one millisecond " +
+                                                                            "to override/supersede any potential tombstone that may have been generated " +
+                                                                            "during compaction of the affected rows.";
+
     private static final String TOOL_NAME = "sstablescrub";
     private static final String VERBOSE_OPTION  = "verbose";
     private static final String DEBUG_OPTION  = "debug";
@@ -51,10 +58,14 @@ public class StandaloneScrubber
     private static final String MANIFEST_CHECK_OPTION  = "manifest-check";
     private static final String SKIP_CORRUPTED_OPTION = "skip-corrupted";
     private static final String NO_VALIDATE_OPTION = "no-validate";
+    private static final String REINSERT_OVERFLOWED_TTL_OPTION = "reinsert-overflowed-ttl";
+    private static final String HEADERFIX_OPTION = "header-fix";
 
     public static void main(String args[])
     {
         Options options = Options.parseArgs(args);
+        Util.initDatabaseDescriptor();
+
         try
         {
             // load keyspace descriptions.
@@ -85,34 +96,106 @@ public class StandaloneScrubber
 
             OutputHandler handler = new OutputHandler.SystemOutput(options.verbose, options.debug);
             Directories.SSTableLister lister = cfs.getDirectories().sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);
+            List<Pair<Descriptor, Set<Component>>> listResult = new ArrayList<>();
+
+            // create snapshot
+            for (Map.Entry<Descriptor, Set<Component>> entry : lister.list().entrySet())
+            {
+                Descriptor descriptor = entry.getKey();
+                Set<Component> components = entry.getValue();
+                if (!components.contains(Component.DATA))
+                    continue;
+
+                listResult.add(Pair.create(descriptor, components));
+
+                File snapshotDirectory = Directories.getSnapshotDirectory(descriptor, snapshotName);
+                SSTableReader.createLinks(descriptor, components, snapshotDirectory.getPath());
+            }
+            System.out.println(String.format("Pre-scrub sstables snapshotted into snapshot %s", snapshotName));
+
+            if (options.headerFixMode != Options.HeaderFixMode.OFF)
+            {
+                // Run the frozen-UDT checks _before_ the sstables are opened
+
+                List<String> logOutput = new ArrayList<>();
+
+                SSTableHeaderFix.Builder headerFixBuilder = SSTableHeaderFix.builder()
+                                                                            .logToList(logOutput)
+                                                                            .schemaCallback(() -> Schema.instance::getCFMetaData);
+                if (options.headerFixMode == Options.HeaderFixMode.VALIDATE)
+                    headerFixBuilder = headerFixBuilder.dryRun();
+
+                for (Pair<Descriptor, Set<Component>> p : listResult)
+                    headerFixBuilder.withPath(Paths.get(p.left.filenameFor(Component.DATA)));
+
+                SSTableHeaderFix headerFix = headerFixBuilder.build();
+                try
+                {
+                    headerFix.execute();
+                }
+                catch (Exception e)
+                {
+                    JVMStabilityInspector.inspectThrowable(e);
+                    if (options.debug)
+                        e.printStackTrace(System.err);
+                }
+
+                if (headerFix.hasChanges() || headerFix.hasError())
+                    logOutput.forEach(System.out::println);
+
+                if (headerFix.hasError())
+                {
+                    System.err.println("Errors in serialization-header detected, aborting.");
+                    System.exit(1);
+                }
+
+                switch (options.headerFixMode)
+                {
+                    case VALIDATE_ONLY:
+                    case FIX_ONLY:
+                        System.out.printf("Not continuing with scrub, since '--%s %s' was specified.%n",
+                                          HEADERFIX_OPTION,
+                                          options.headerFixMode.asCommandLineOption());
+                        System.exit(0);
+                    case VALIDATE:
+                        if (headerFix.hasChanges())
+                        {
+                            System.err.printf("Unfixed, but fixable errors in serialization-header detected, aborting. " +
+                                              "Use a non-validating mode ('-e %s' or '-e %s') for --%s%n",
+                                              Options.HeaderFixMode.FIX.asCommandLineOption(),
+                                              Options.HeaderFixMode.FIX_ONLY.asCommandLineOption(),
+                                              HEADERFIX_OPTION);
+                            System.exit(2);
+                        }
+                        break;
+                    case FIX:
+                        break;
+                }
+            }
 
             List<SSTableReader> sstables = new ArrayList<>();
 
-            // Scrub sstables
-            for (Map.Entry<Descriptor, Set<Component>> entry : lister.list().entrySet())
+            // Open sstables
+            for (Pair<Descriptor, Set<Component>> pair : listResult)
             {
-                Set<Component> components = entry.getValue();
+                Descriptor descriptor = pair.left;
+                Set<Component> components = pair.right;
                 if (!components.contains(Component.DATA))
                     continue;
 
                 try
                 {
-                    SSTableReader sstable = SSTableReader.openNoValidation(entry.getKey(), components, cfs);
+                    SSTableReader sstable = SSTableReader.openNoValidation(descriptor, components, cfs);
                     sstables.add(sstable);
-
-                    File snapshotDirectory = Directories.getSnapshotDirectory(sstable.descriptor, snapshotName);
-                    sstable.createLinks(snapshotDirectory.getPath());
-
                 }
                 catch (Exception e)
                 {
                     JVMStabilityInspector.inspectThrowable(e);
-                    System.err.println(String.format("Error Loading %s: %s", entry.getKey(), e.getMessage()));
+                    System.err.println(String.format("Error Loading %s: %s", descriptor, e.getMessage()));
                     if (options.debug)
                         e.printStackTrace(System.err);
                 }
             }
-            System.out.println(String.format("Pre-scrub sstables snapshotted into snapshot %s", snapshotName));
 
             if (!options.manifestCheckOnly)
             {
@@ -121,7 +204,7 @@ public class StandaloneScrubber
                     try (LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.SCRUB, sstable))
                     {
                         txn.obsoleteOriginals(); // make sure originals are deleted and avoid NPE if index is missing, CASSANDRA-9591
-                        try (Scrubber scrubber = new Scrubber(cfs, txn, options.skipCorrupted, handler, true, !options.noValidate))
+                        try (Scrubber scrubber = new Scrubber(cfs, txn, options.skipCorrupted, handler, !options.noValidate, options.reinserOverflowedTTL))
                         {
                             scrubber.scrub();
                         }
@@ -145,7 +228,7 @@ public class StandaloneScrubber
             // Check (and repair) manifests
             checkManifest(cfs.getCompactionStrategyManager(), cfs, sstables);
             CompactionManager.instance.finishCompactionsAndShutdown(5, TimeUnit.MINUTES);
-            TransactionLog.waitForDeletions();
+            LifecycleTransaction.waitForDeletions();
             System.exit(0); // We need that to stop non daemonized threads
         }
         catch (Exception e)
@@ -159,32 +242,22 @@ public class StandaloneScrubber
 
     private static void checkManifest(CompactionStrategyManager strategyManager, ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
     {
-        int maxSizeInMB = (int)((cfs.getCompactionStrategyManager().getMaxSSTableBytes()) / (1024L * 1024L));
-        if (strategyManager.getStrategies().size() == 2 && strategyManager.getStrategies().get(0) instanceof LeveledCompactionStrategy)
+        if (strategyManager.getCompactionParams().klass().equals(LeveledCompactionStrategy.class))
         {
-            System.out.println("Checking leveled manifest");
-            Predicate<SSTableReader> repairedPredicate = new Predicate<SSTableReader>()
-            {
-                @Override
-                public boolean apply(SSTableReader sstable)
-                {
-                    return sstable.isRepaired();
-                }
-            };
+            int maxSizeInMB = (int)((cfs.getCompactionStrategyManager().getMaxSSTableBytes()) / (1024L * 1024L));
+            int fanOut = cfs.getCompactionStrategyManager().getLevelFanoutSize();
+            List<SSTableReader> repaired = new ArrayList<>();
+            List<SSTableReader> unrepaired = new ArrayList<>();
 
-            List<SSTableReader> repaired = Lists.newArrayList(Iterables.filter(sstables, repairedPredicate));
-            List<SSTableReader> unRepaired = Lists.newArrayList(Iterables.filter(sstables, Predicates.not(repairedPredicate)));
-
-            LeveledManifest repairedManifest = LeveledManifest.create(cfs, maxSizeInMB, repaired);
-            for (int i = 1; i < repairedManifest.getLevelCount(); i++)
+            for (SSTableReader sstable : sstables)
             {
-                repairedManifest.repairOverlappingSSTables(i);
+                if (sstable.isRepaired())
+                    repaired.add(sstable);
+                else
+                    unrepaired.add(sstable);
             }
-            LeveledManifest unRepairedManifest = LeveledManifest.create(cfs, maxSizeInMB, unRepaired);
-            for (int i = 1; i < unRepairedManifest.getLevelCount(); i++)
-            {
-                unRepairedManifest.repairOverlappingSSTables(i);
-            }
+            LeveledManifest.create(cfs, maxSizeInMB, fanOut, repaired);
+            LeveledManifest.create(cfs, maxSizeInMB, fanOut, unrepaired);
         }
     }
 
@@ -198,6 +271,27 @@ public class StandaloneScrubber
         public boolean manifestCheckOnly;
         public boolean skipCorrupted;
         public boolean noValidate;
+        public boolean reinserOverflowedTTL;
+        public HeaderFixMode headerFixMode = HeaderFixMode.VALIDATE;
+
+        enum HeaderFixMode
+        {
+            VALIDATE_ONLY,
+            VALIDATE,
+            FIX_ONLY,
+            FIX,
+            OFF;
+
+            static HeaderFixMode fromCommandLine(String value)
+            {
+                return valueOf(value.replace('-', '_').toUpperCase().trim());
+            }
+
+            String asCommandLineOption()
+            {
+                return name().toLowerCase().replace('_', '-');
+            }
+        }
 
         private Options(String keyspaceName, String cfName)
         {
@@ -238,7 +332,19 @@ public class StandaloneScrubber
                 opts.manifestCheckOnly = cmd.hasOption(MANIFEST_CHECK_OPTION);
                 opts.skipCorrupted = cmd.hasOption(SKIP_CORRUPTED_OPTION);
                 opts.noValidate = cmd.hasOption(NO_VALIDATE_OPTION);
-
+                opts.reinserOverflowedTTL = cmd.hasOption(REINSERT_OVERFLOWED_TTL_OPTION);
+                if (cmd.hasOption(HEADERFIX_OPTION))
+                {
+                    try
+                    {
+                        opts.headerFixMode = HeaderFixMode.fromCommandLine(cmd.getOptionValue(HEADERFIX_OPTION));
+                    }
+                    catch (Exception e)
+                    {
+                        errorMsg(String.format("Invalid argument value '%s' for --%s", cmd.getOptionValue(HEADERFIX_OPTION), HEADERFIX_OPTION), options);
+                        return null;
+                    }
+                }
                 return opts;
             }
             catch (ParseException e)
@@ -264,6 +370,23 @@ public class StandaloneScrubber
             options.addOption("m",  MANIFEST_CHECK_OPTION, "only check and repair the leveled manifest, without actually scrubbing the sstables");
             options.addOption("s",  SKIP_CORRUPTED_OPTION, "skip corrupt rows in counter tables");
             options.addOption("n",  NO_VALIDATE_OPTION,    "do not validate columns using column validator");
+            options.addOption("e",  HEADERFIX_OPTION,      true, "Option whether and how to perform a " +
+                                                                 "check of the sstable serialization-headers and fix known, " +
+                                                                 "fixable issues.\n" +
+                                                                 "Possible argument values:\n" +
+                                                                 "- validate-only: validate the serialization-headers, " +
+                                                                 "but do not fix those. Do not continue with scrub - " +
+                                                                 "i.e. only validate the header (dry-run of fix-only).\n" +
+                                                                 "- validate: (default) validate the serialization-headers, " +
+                                                                 "but do not fix those and only continue with scrub if no " +
+                                                                 "error were detected.\n" +
+                                                                 "- fix-only: validate and fix the serialization-headers, " +
+                                                                 "don't continue with scrub.\n" +
+                                                                 "- fix: validate and fix the serialization-headers, do not " +
+                                                                 "fix and do not continue with scrub if the serialization-header " +
+                                                                 "check encountered errors.\n" +
+                                                                 "- off: don't perform the serialization-header checks.");
+            options.addOption("r", REINSERT_OVERFLOWED_TTL_OPTION, REINSERT_OVERFLOWED_TTL_OPTION_DESCRIPTION);
             return options;
         }
 
@@ -275,7 +398,7 @@ public class StandaloneScrubber
             header.append("Scrub the sstable for the provided table." );
             header.append("\n--\n");
             header.append("Options are:");
-            new HelpFormatter().printHelp(usage, header.toString(), options, "");
+            new HelpFormatter().printHelp(120, usage, header.toString(), options, "");
         }
     }
 }

@@ -1,3 +1,21 @@
+/*
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
 CREATE TABLE has_all_types (
     num int PRIMARY KEY,
     intcol int,
@@ -28,7 +46,7 @@ INSERT INTO has_all_types (num, intcol, asciicol, bigintcol, blobcol, booleancol
                            decimalcol, doublecol, floatcol, smallintcol, textcol,
                            timestampcol, tinyintcol, uuidcol, varcharcol, varintcol)
 VALUES (1, 2147483647, '__!''$#@!~"', 9223372036854775807, 0xffffffffffffffffff, true,
-        0.00000000000001, 9999999.999, 99999.99, 32767, '∭Ƕ⑮ฑ➳❏''',
+        0.00000000000001, 9999999.999, 99999.999, 32767, '∭Ƕ⑮ฑ➳❏''',
         '1950-01-01+0000', 127, ffffffff-ffff-ffff-ffff-ffffffffffff, 'newline->
 <-', 9);
 
@@ -258,3 +276,38 @@ values (
             'origin':'england'
         }
     });
+
+CREATE FUNCTION fBestband ( input double )
+    RETURNS NULL ON NULL INPUT
+    RETURNS text 
+    LANGUAGE java
+    AS 'return "Iron Maiden";';
+
+CREATE FUNCTION fBestsong ( input double )
+    RETURNS NULL ON NULL INPUT
+    RETURNS text 
+    LANGUAGE java
+    AS 'return "Revelations";';
+
+CREATE FUNCTION fMax(current int, candidate int)
+    CALLED ON NULL INPUT
+    RETURNS int 
+    LANGUAGE java 
+    AS 'if (current == null) return candidate; else return Math.max(current, candidate);' ;
+
+CREATE FUNCTION fMin(current int, candidate int)
+    CALLED ON NULL INPUT
+    RETURNS int
+    LANGUAGE java 
+    AS 'if (current == null) return candidate; else return Math.min(current, candidate);' ;
+
+CREATE AGGREGATE aggMax(int)
+    SFUNC fMax
+    STYPE int
+    INITCOND null;
+
+CREATE AGGREGATE aggMin(int)
+    SFUNC fMin
+    STYPE int
+    INITCOND null;
+

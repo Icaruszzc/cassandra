@@ -32,7 +32,7 @@ import org.apache.cassandra.gms.*;
 
 public class LoadBroadcaster implements IEndpointStateChangeSubscriber
 {
-    static final int BROADCAST_INTERVAL = 60 * 1000;
+    static final int BROADCAST_INTERVAL = Integer.getInteger("cassandra.broadcast_interval_ms", 60 * 1000);
 
     public static final LoadBroadcaster instance = new LoadBroadcaster();
 
@@ -60,14 +60,6 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
             onChange(endpoint, ApplicationState.LOAD, localValue);
         }
     }
-    
-    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
-
-    public void onAlive(InetAddress endpoint, EndpointState state) {}
-
-    public void onDead(InetAddress endpoint, EndpointState state) {}
-
-    public void onRestart(InetAddress endpoint, EndpointState state) {}
 
     public void onRemove(InetAddress endpoint)
     {
@@ -87,8 +79,10 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
         {
             public void run()
             {
-                if (logger.isDebugEnabled())
-                    logger.debug("Disseminating load info ...");
+                if (!Gossiper.instance.isEnabled())
+                    return;
+                if (logger.isTraceEnabled())
+                    logger.trace("Disseminating load info ...");
                 Gossiper.instance.addLocalApplicationState(ApplicationState.LOAD,
                                                            StorageService.instance.valueFactory.load(StorageMetrics.load.getCount()));
             }

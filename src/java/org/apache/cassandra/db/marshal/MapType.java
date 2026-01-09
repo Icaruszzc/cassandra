@@ -29,7 +29,7 @@ import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.MapSerializer;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.Pair;
 
 public class MapType<K, V> extends CollectionType<Map<K, V>>
@@ -67,11 +67,25 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
 
     private MapType(AbstractType<K> keys, AbstractType<V> values, boolean isMultiCell)
     {
-        super(Kind.MAP);
+        super(ComparisonType.CUSTOM, Kind.MAP);
         this.keys = keys;
         this.values = values;
         this.serializer = MapSerializer.getInstance(keys.getSerializer(), values.getSerializer(), keys);
         this.isMultiCell = isMultiCell;
+    }
+
+    @Override
+    public boolean referencesUserType(String userTypeName)
+    {
+        return getKeysType().referencesUserType(userTypeName) ||
+               getValuesType().referencesUserType(userTypeName);
+    }
+
+    @Override
+    public boolean referencesDuration()
+    {
+        // Maps cannot be created with duration as keys
+        return getValuesType().referencesDuration();
     }
 
     public AbstractType<K> getKeysType()
@@ -110,6 +124,23 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     }
 
     @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
+            return this;
+
+        AbstractType<?> keyType = (keys.isFreezable() && keys.isMultiCell())
+                                ? keys.freeze()
+                                : keys.freezeNestedMulticellTypes();
+
+        AbstractType<?> valueType = (values.isFreezable() && values.isMultiCell())
+                                  ? values.freeze()
+                                  : values.freezeNestedMulticellTypes();
+
+        return getInstance(keyType, valueType, isMultiCell);
+    }
+
+    @Override
     public boolean isCompatibleWithFrozen(CollectionType<?> previous)
     {
         assert !isMultiCell;
@@ -126,7 +157,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     }
 
     @Override
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return compareMaps(keys, values, o1, o2);
     }
@@ -139,7 +170,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
         ByteBuffer bb1 = o1.duplicate();
         ByteBuffer bb2 = o2.duplicate();
 
-        int protocolVersion = Server.VERSION_3;
+        ProtocolVersion protocolVersion = ProtocolVersion.V3;
         int size1 = CollectionSerializer.readCollectionSize(bb1, protocolVersion);
         int size2 = CollectionSerializer.readCollectionSize(bb2, protocolVersion);
 
@@ -165,11 +196,6 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     public MapSerializer<K, V> getSerializer()
     {
         return serializer;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return keys.isByteOrderComparable();
     }
 
     @Override
@@ -230,24 +256,25 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
+        ByteBuffer value = buffer.duplicate();
         StringBuilder sb = new StringBuilder("{");
-        int size = CollectionSerializer.readCollectionSize(buffer, protocolVersion);
+        int size = CollectionSerializer.readCollectionSize(value, protocolVersion);
         for (int i = 0; i < size; i++)
         {
             if (i > 0)
                 sb.append(", ");
 
             // map keys must be JSON strings, so convert non-string keys to strings
-            String key = keys.toJSONString(CollectionSerializer.readValue(buffer, protocolVersion), protocolVersion);
+            String key = keys.toJSONString(CollectionSerializer.readValue(value, protocolVersion), protocolVersion);
             if (key.startsWith("\""))
                 sb.append(key);
             else
-                sb.append('"').append(Json.JSON_STRING_ENCODER.quoteAsString(key)).append('"');
+                sb.append('"').append(Json.quoteAsJsonString(key)).append('"');
 
             sb.append(": ");
-            sb.append(values.toJSONString(CollectionSerializer.readValue(buffer, protocolVersion), protocolVersion));
+            sb.append(values.toJSONString(CollectionSerializer.readValue(value, protocolVersion), protocolVersion));
         }
         return sb.append("}").toString();
     }

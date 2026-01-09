@@ -22,9 +22,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 
-import org.apache.cassandra.utils.vint.VIntCoding;
-
 import com.google.common.base.Function;
+
+import org.apache.cassandra.utils.vint.VIntCoding;
 
 /**
  * Extension to DataOutput that provides for writing ByteBuffer and Memory, potentially with an efficient
@@ -49,15 +49,37 @@ public interface DataOutputPlus extends DataOutput
     }
 
     /**
-     * Think hard before opting for an unsigned encoding. Is this going to bite someone because some day
-     * they might need to pass in a sentinel value using negative numbers? Is the risk worth it
-     * to save a few bytes?
+     * This is more efficient for storing unsigned values, both in storage and CPU burden.
      *
-     * Signed, not a fan of unsigned values in protocols and formats
+     * Note that it is still possible to store negative values, they just take up more space.
+     * So this method doesn't forbid e.g. negative sentinel values in future, if they need to be snuck in.
+     * A protocol version bump can then be introduced to improve efficiency.
      */
     default void writeUnsignedVInt(long i) throws IOException
     {
         VIntCoding.writeUnsignedVInt(i, this);
     }
 
+    /**
+     * Returns the current position of the underlying target like a file-pointer
+     * or the position withing a buffer. Not every implementation may support this
+     * functionality. Whether or not this functionality is supported can be checked
+     * via the {@link #hasPosition()}.
+     *
+     * @throws UnsupportedOperationException if the implementation does not support
+     *                                       position
+     */
+    default long position()
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * If the implementation supports providing a position, this method returns
+     * {@code true}, otherwise {@code false}.
+     */
+    default boolean hasPosition()
+    {
+        return false;
+    }
 }

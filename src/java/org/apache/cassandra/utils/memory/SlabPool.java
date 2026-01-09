@@ -22,7 +22,7 @@ public class SlabPool extends MemtablePool
 {
     final boolean allocateOnHeap;
 
-    public SlabPool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanupThreshold, Runnable cleaner)
+    public SlabPool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanupThreshold, MemtableCleaner cleaner)
     {
         super(maxOnHeapMemory, maxOffHeapMemory, cleanupThreshold, cleaner);
         this.allocateOnHeap = maxOffHeapMemory == 0;
@@ -31,10 +31,5 @@ public class SlabPool extends MemtablePool
     public MemtableAllocator newAllocator()
     {
         return new SlabAllocator(onHeap.newAllocator(), offHeap.newAllocator(), allocateOnHeap);
-    }
-
-    public boolean needToCopyOnHeap()
-    {
-        return !allocateOnHeap;
     }
 }

@@ -17,18 +17,16 @@
  */
 package org.apache.cassandra.io.sstable.format.big;
 
+import java.util.Collection;
 import java.util.Set;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.format.SSTableFormat;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
-import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.format.*;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.net.MessagingService;
@@ -40,7 +38,7 @@ import org.apache.cassandra.utils.ChecksumType;
 public class BigFormat implements SSTableFormat
 {
     public static final BigFormat instance = new BigFormat();
-    public static final BigVersion latestVersion = new BigVersion(BigVersion.current_version);
+    public static final Version latestVersion = new BigVersion(BigVersion.current_version);
     private static final SSTableReader.Factory readerFactory = new ReaderFactory();
     private static final SSTableWriter.Factory writerFactory = new WriterFactory();
 
@@ -88,9 +86,10 @@ public class BigFormat implements SSTableFormat
                                   CFMetaData metadata,
                                   MetadataCollector metadataCollector,
                                   SerializationHeader header,
-                                  LifecycleTransaction txn)
+                                  Collection<SSTableFlushObserver> observers,
+                                  LifecycleNewTracker lifecycleNewTracker)
         {
-            return new BigTableWriter(descriptor, keyCount, repairedAt, metadata, metadataCollector, header, txn);
+            return new BigTableWriter(descriptor, keyCount, repairedAt, metadata, metadataCollector, header, observers, lifecycleNewTracker);
         }
     }
 
@@ -111,7 +110,7 @@ public class BigFormat implements SSTableFormat
     // we always incremented the major version.
     static class BigVersion extends Version
     {
-        public static final String current_version = "ma";
+        public static final String current_version = "me";
         public static final String earliest_supported_version = "jb";
 
         // jb (2.0.1): switch from crc32 to adler32 for compression checksums
@@ -121,8 +120,15 @@ public class BigFormat implements SSTableFormat
         //             switch uncompressed checksums to adler32
         //             tracks presense of legacy (local and remote) counter shards
         // la (2.2.0): new file name format
+        // lb (2.2.7): commit log lower bound included
         // ma (3.0.0): swap bf hash order
         //             store rows natively
+        // mb (3.0.7, 3.7): commit log lower bound included
+        // mc (3.0.8, 3.9): commit log intervals included
+        // md (3.0.18, 3.11.4): corrected sstable min/max clustering
+        // me (3.0.25, 3.11.11): added hostId of the node from which the sstable originated
+        //
+        // NOTE: when adding a new version, please add that to LegacySSTableTest, too.
 
         private final boolean isLatestVersion;
         private final boolean hasSamplingLevel;
@@ -134,11 +140,16 @@ public class BigFormat implements SSTableFormat
         private final boolean newFileName;
         public final boolean storeRows;
         public final int correspondingMessagingVersion; // Only use by storage that 'storeRows' so far
+        public final boolean hasBoundaries;
         /**
          * CASSANDRA-8413: 3.0 bloom filter representation changed (two longs just swapped)
          * have no 'static' bits caused by using the same upper bits for both bloom filter and token distribution.
          */
         private final boolean hasOldBfHashOrder;
+        private final boolean hasCommitLogLowerBound;
+        private final boolean hasCommitLogIntervals;
+        private final boolean hasAccurateMinMax;
+        private final boolean hasOriginatingHostId;
 
         /**
          * CASSANDRA-7066: compaction ancerstors are no longer used and have been removed.
@@ -176,6 +187,13 @@ public class BigFormat implements SSTableFormat
             correspondingMessagingVersion = storeRows
                                           ? MessagingService.VERSION_30
                                           : MessagingService.VERSION_21;
+
+            hasBoundaries = version.compareTo("ma") < 0;
+            hasCommitLogLowerBound = (version.compareTo("lb") >= 0 && version.compareTo("ma") < 0)
+                                     || version.compareTo("mb") >= 0;
+            hasCommitLogIntervals = version.compareTo("mc") >= 0;
+            hasAccurateMinMax = version.compareTo("md") >= 0;
+            hasOriginatingHostId = version.matches("m[e-z]");
         }
 
         @Override
@@ -239,6 +257,24 @@ public class BigFormat implements SSTableFormat
         }
 
         @Override
+        public boolean hasCommitLogLowerBound()
+        {
+            return hasCommitLogLowerBound;
+        }
+
+        @Override
+        public boolean hasCommitLogIntervals()
+        {
+            return hasCommitLogIntervals;
+        }
+
+        @Override
+        public boolean hasAccurateMinMax()
+        {
+            return hasAccurateMinMax;
+        }
+
+        @Override
         public boolean storeRows()
         {
             return storeRows;
@@ -251,6 +287,12 @@ public class BigFormat implements SSTableFormat
         }
 
         @Override
+        public boolean hasBoundaries()
+        {
+            return hasBoundaries;
+        }
+
+        @Override
         public boolean isCompatible()
         {
             return version.compareTo(earliest_supported_version) >= 0 && version.charAt(0) <= current_version.charAt(0);
@@ -260,6 +302,11 @@ public class BigFormat implements SSTableFormat
         public boolean isCompatibleForStreaming()
         {
             return isCompatible() && version.charAt(0) == current_version.charAt(0);
+        }
+
+        public boolean hasOriginatingHostId()
+        {
+            return hasOriginatingHostId;
         }
     }
 }

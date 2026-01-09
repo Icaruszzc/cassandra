@@ -19,6 +19,7 @@ package org.apache.cassandra.cache;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -51,9 +52,23 @@ public class AutoSavingCacheTest
     }
 
     @Test
+    public void testSerializeAndLoadKeyCache0kB() throws Exception
+    {
+        DatabaseDescriptor.setColumnIndexCacheSize(0);
+        doTestSerializeAndLoadKeyCache();
+    }
+
+    @Test
     public void testSerializeAndLoadKeyCache() throws Exception
     {
+        DatabaseDescriptor.setColumnIndexCacheSize(8);
+        doTestSerializeAndLoadKeyCache();
+    }
+
+    private static void doTestSerializeAndLoadKeyCache() throws Exception
+    {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
         for (int i = 0; i < 2; i++)
         {
             ColumnDefinition colDef = ColumnDefinition.regularDef(cfs.metadata, ByteBufferUtil.bytes("col1"), AsciiType.instance);
@@ -78,9 +93,8 @@ public class AutoSavingCacheTest
         Assert.assertEquals(0, keyCache.size());
 
         // then load saved
-        keyCache.loadSaved(cfs);
-        Assert.assertEquals(2, keyCache.size());
+        keyCache.loadSavedAsync().get();
         for (SSTableReader sstable : cfs.getLiveSSTables())
-            Assert.assertNotNull(keyCache.get(new KeyCacheKey(cfs.metadata.cfId, sstable.descriptor, ByteBufferUtil.bytes("key1"))));
+            Assert.assertNotNull(keyCache.get(new KeyCacheKey(cfs.metadata.ksAndCFName, sstable.descriptor, ByteBufferUtil.bytes("key1"))));
     }
 }

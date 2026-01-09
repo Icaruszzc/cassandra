@@ -21,9 +21,10 @@ package org.apache.cassandra.utils;
 import java.math.BigInteger;
 import java.util.*;
 
-import org.apache.cassandra.utils.AbstractIterator;
+import com.google.common.collect.Lists;
 
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
@@ -59,6 +60,12 @@ public class MerkleTreeTest
     private Range<Token> fullRange()
     {
         return new Range<>(partitioner.getMinimumToken(), partitioner.getMinimumToken());
+    }
+
+    @BeforeClass
+    public static void beforeClass()
+    {
+        DatabaseDescriptor.daemonInitialization();
     }
 
     @Before
@@ -440,6 +447,72 @@ public class MerkleTreeTest
         List<TreeRange> diffs = MerkleTree.difference(mt, mt2);
         assertEquals(diffs + " contains wrong number of differences:", 1, diffs.size());
         assertTrue(diffs.contains(new Range<>(leftmost.left, middle.right)));
+    }
+
+    /**
+     * difference should behave as expected, even with extremely small ranges
+     */
+    @Test
+    public void differenceSmallRange()
+    {
+        Token start = new BigIntegerToken("9");
+        Token end = new BigIntegerToken("10");
+        Range<Token> range = new Range<>(start, end);
+
+        MerkleTree ltree = new MerkleTree(partitioner, range, RECOMMENDED_DEPTH, 16);
+        ltree.init();
+        MerkleTree rtree = new MerkleTree(partitioner, range, RECOMMENDED_DEPTH, 16);
+        rtree.init();
+
+        byte[] h1 = "asdf".getBytes();
+        byte[] h2 = "hjkl".getBytes();
+
+        // add dummy hashes to both trees
+        for (TreeRange tree : ltree.invalids())
+        {
+            tree.addHash(new RowHash(range.right, h1, h1.length));
+        }
+        for (TreeRange tree : rtree.invalids())
+        {
+            tree.addHash(new RowHash(range.right, h2, h2.length));
+        }
+
+        List<TreeRange> diffs = MerkleTree.difference(ltree, rtree);
+        assertEquals(Lists.newArrayList(range), diffs);
+        assertEquals(MerkleTree.FULLY_INCONSISTENT, MerkleTree.differenceHelper(ltree, rtree, new ArrayList<>(), new MerkleTree.TreeDifference(ltree.fullRange.left, ltree.fullRange.right, (byte)0)));
+    }
+
+    /**
+     * matching should behave as expected, even with extremely small ranges
+     */
+    @Test
+    public void matchingSmallRange()
+    {
+        Token start = new BigIntegerToken("9");
+        Token end = new BigIntegerToken("10");
+        Range<Token> range = new Range<>(start, end);
+
+        MerkleTree ltree = new MerkleTree(partitioner, range, RECOMMENDED_DEPTH, 16);
+        ltree.init();
+        MerkleTree rtree = new MerkleTree(partitioner, range, RECOMMENDED_DEPTH, 16);
+        rtree.init();
+
+        byte[] h1 = "asdf".getBytes();
+        byte[] h2 = "asdf".getBytes();
+
+
+        // add dummy hashes to both trees
+        for (TreeRange tree : ltree.invalids())
+        {
+            tree.addHash(new RowHash(range.right, h1, h1.length));
+        }
+        for (TreeRange tree : rtree.invalids())
+        {
+            tree.addHash(new RowHash(range.right, h2, h2.length));
+        }
+
+        // top level difference() should show no differences
+        assertEquals(MerkleTree.difference(ltree, rtree), Lists.newArrayList());
     }
 
     /**

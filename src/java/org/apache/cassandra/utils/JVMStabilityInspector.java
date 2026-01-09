@@ -21,8 +21,10 @@ import java.io.FileNotFoundException;
 import java.net.SocketException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,9 +33,8 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
-import org.apache.cassandra.service.CassandraDaemon;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.Cassandra;
 
 /**
  * Responsible for deciding whether to kill the JVM if it gets in an "unstable" state (think OOM).
@@ -43,43 +44,88 @@ public final class JVMStabilityInspector
     private static final Logger logger = LoggerFactory.getLogger(JVMStabilityInspector.class);
     private static Killer killer = new Killer();
 
+    private static Object lock = new Object();
+    private static boolean printingHeapHistogram;
 
     private JVMStabilityInspector() {}
 
     /**
      * Certain Throwables and Exceptions represent "Die" conditions for the server.
+     * This recursively checks the input Throwable's cause hierarchy until null.
      * @param t
      *      The Throwable to check for server-stop conditions
      */
     public static void inspectThrowable(Throwable t)
     {
-        boolean isUnstable = false;
-        if (t instanceof OutOfMemoryError)
-            isUnstable = true;
-
-        if (DatabaseDescriptor.getDiskFailurePolicy() == Config.DiskFailurePolicy.die)
-            if (t instanceof FSError || t instanceof CorruptSSTableException)
-            isUnstable = true;
-
-        // Check for file handle exhaustion
-        if (t instanceof FileNotFoundException || t instanceof SocketException)
-            if (t.getMessage().contains("Too many open files"))
-                isUnstable = true;
-
-        if (isUnstable)
-            killer.killCurrentJVM(t);
+        inspectThrowable(t, JVMStabilityInspector::inspectDiskError);
     }
 
     public static void inspectCommitLogThrowable(Throwable t)
     {
-        if (!StorageService.instance.isSetupCompleted())
+        inspectThrowable(t, JVMStabilityInspector::inspectCommitLogError);
+    }
+
+    private static void inspectDiskError(Throwable t)
+    {
+        if (t instanceof CorruptSSTableException)
+            FileUtils.handleCorruptSSTable((CorruptSSTableException) t);
+        else if (t instanceof FSError)
+            FileUtils.handleFSError((FSError) t);
+    }
+
+    public static void inspectThrowable(Throwable t, Consumer<Throwable> fn) throws OutOfMemoryError
+    {
+        boolean isUnstable = false;
+        if (t instanceof OutOfMemoryError)
+        {
+            if (Boolean.getBoolean("cassandra.printHeapHistogramOnOutOfMemoryError"))
+            {
+                // We want to avoid printing multiple time the heap histogram if multiple OOM errors happen in a short
+                // time span.
+                synchronized(lock)
+                {
+                    if (printingHeapHistogram)
+                        return;
+                    printingHeapHistogram = true;
+                }
+                HeapUtils.logHeapHistogram();
+            }
+
+            logger.error("OutOfMemory error letting the JVM handle the error:", t);
+
+            StorageService.instance.removeShutdownHook();
+            // We let the JVM handle the error. The startup checks should have warned the user if it did not configure
+            // the JVM behavior in case of OOM (CASSANDRA-13006).
+            throw (OutOfMemoryError) t;
+        }
+
+        if (DatabaseDescriptor.getDiskFailurePolicy() == Config.DiskFailurePolicy.die)
+            if (t instanceof FSError || t instanceof CorruptSSTableException)
+                isUnstable = true;
+
+        fn.accept(t);
+
+        // Check for file handle exhaustion
+        if (t instanceof FileNotFoundException || t instanceof SocketException)
+            if (t.getMessage() != null && t.getMessage().contains("Too many open files"))
+                isUnstable = true;
+
+        if (isUnstable)
+            killer.killCurrentJVM(t);
+
+        if (t.getCause() != null)
+            inspectThrowable(t.getCause(), fn);
+    }
+
+    private static void inspectCommitLogError(Throwable t)
+    {
+        if (!StorageService.instance.isDaemonSetupCompleted())
         {
             logger.error("Exiting due to error while processing commit log during initialization.", t);
             killer.killCurrentJVM(t, true);
-        } else if (DatabaseDescriptor.getCommitFailurePolicy() == Config.CommitFailurePolicy.die)
+        }
+        else if (DatabaseDescriptor.getCommitFailurePolicy() == Config.CommitFailurePolicy.die)
             killer.killCurrentJVM(t);
-        else
-            inspectThrowable(t);
     }
 
     public static void killCurrentJVM(Throwable t, boolean quiet)
@@ -105,7 +151,8 @@ public final class JVMStabilityInspector
     }
 
     @VisibleForTesting
-    public static Killer replaceKiller(Killer newKiller) {
+    public static Killer replaceKiller(Killer newKiller)
+    {
         Killer oldKiller = JVMStabilityInspector.killer;
         JVMStabilityInspector.killer = newKiller;
         return oldKiller;

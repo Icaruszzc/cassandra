@@ -26,22 +26,18 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.InetAddressSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class InetAddressType extends AbstractType<InetAddress>
 {
     public static final InetAddressType instance = new InetAddressType();
 
-    InetAddressType() {} // singleton
+    InetAddressType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
-    }
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
-    {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -78,10 +74,15 @@ public class InetAddressType extends AbstractType<InetAddress>
         }
     }
 
-    @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    private String toString(InetAddress inet)
     {
-        return '"' + getSerializer().deserialize(buffer).getHostAddress() + '"';
+        return inet != null ? inet.getHostAddress() : "";
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return '"' + toString(getSerializer().deserialize(buffer)) + '"';
     }
 
     public CQL3Type asCQL3Type()
@@ -92,10 +93,5 @@ public class InetAddressType extends AbstractType<InetAddress>
     public TypeSerializer<InetAddress> getSerializer()
     {
         return InetAddressSerializer.instance;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return true;
     }
 }

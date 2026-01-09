@@ -23,7 +23,10 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.cql3.CQL3Type;
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableMap;
+
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -38,7 +41,7 @@ public class TypeParser
     private int idx;
 
     // A cache of parsed string, specially useful for DynamicCompositeType
-    private static final Map<String, AbstractType<?>> cache = new HashMap<>();
+    private static volatile ImmutableMap<String, AbstractType<?>> cache = ImmutableMap.of();
 
     public static final TypeParser EMPTY_PARSER = new TypeParser("", 0);
 
@@ -61,6 +64,7 @@ public class TypeParser
         if (str == null)
             return BytesType.instance;
 
+        // A single volatile read of 'cache' should not hurt.
         AbstractType<?> type = cache.get(str);
 
         if (type != null)
@@ -84,58 +88,32 @@ public class TypeParser
         else
             type = getAbstractType(name);
 
-        // We don't really care about concurrency here. Worst case scenario, we do some parsing unnecessarily
-        cache.put(str, type);
-        return type;
+        Verify.verify(type != null, "Parsing %s yielded null, which is a bug", str);
+
+        // Prevent concurrent modification to the map acting as the cache for TypeParser at the expense of
+        // more allocation when the cache needs to be updated, since updates to the cache are rare compared
+        // to the amount of reads.
+        //
+        // Copy the existing cache into a new map and add the parsed AbstractType instance and replace
+        // the cache, if the type is not already in the cache.
+        //
+        // The cache-update is done in a short synchronized block to prevent duplicate instances of AbstractType
+        // for the same string representation.
+        synchronized (TypeParser.class)
+        {
+            if (!cache.containsKey(str))
+            {
+                ImmutableMap.Builder<String, AbstractType<?>> builder = ImmutableMap.builder();
+                builder.putAll(cache).put(str, type);
+                cache = builder.build();
+            }
+            return type;
+        }
     }
 
     public static AbstractType<?> parse(CharSequence compareWith) throws SyntaxException, ConfigurationException
     {
         return parse(compareWith == null ? null : compareWith.toString());
-    }
-
-    public static String parseCqlNativeType(String str)
-    {
-        return CQL3Type.Native.valueOf(str.trim().toUpperCase(Locale.ENGLISH)).getType().toString();
-    }
-
-    public static String parseCqlCollectionOrFrozenType(String str) throws SyntaxException
-    {
-        str = str.trim().toLowerCase();
-        switch (str)
-        {
-            case "map": return "MapType";
-            case "set": return "SetType";
-            case "list": return "ListType";
-            case "frozen": return "FrozenType";
-            default: throw new SyntaxException("Invalid type name" + str);
-        }
-    }
-
-    /**
-     * Turns user facing type names into Abstract Types, 'text' -> UTF8Type
-     */
-    public static AbstractType<?> parseCqlName(String str) throws SyntaxException, ConfigurationException
-    {
-        return parse(parseCqlNameRecurse(str));
-    }
-
-    private static String parseCqlNameRecurse(String str) throws SyntaxException
-    {
-        if (str.indexOf(',') >= 0 && (!str.contains("<") || (str.indexOf(',') < str.indexOf('<'))))
-        {
-            String[] parseString = str.split(",", 2);
-            return parseCqlNameRecurse(parseString[0]) + "," + parseCqlNameRecurse(parseString[1]);
-        }
-        else if (str.contains("<"))
-        {
-            String[] parseString = str.trim().split("<", 2);
-            return parseCqlCollectionOrFrozenType(parseString[0]) + "(" + parseCqlNameRecurse(parseString[1].substring(0, parseString[1].length()-1)) + ")";
-        }
-        else
-        {
-            return parseCqlNativeType(str);
-        }
     }
 
     /**
@@ -583,17 +561,17 @@ public class TypeParser
         return sb.toString();
     }
 
-    public static String stringifyUserTypeParameters(String keysace, ByteBuffer typeName, List<ByteBuffer> columnNames, List<AbstractType<?>> columnTypes)
+    public static String stringifyUserTypeParameters(String keysace, ByteBuffer typeName, List<FieldIdentifier> fields,
+                                                     List<AbstractType<?>> columnTypes, boolean ignoreFreezing)
     {
         StringBuilder sb = new StringBuilder();
         sb.append('(').append(keysace).append(",").append(ByteBufferUtil.bytesToHex(typeName));
 
-        for (int i = 0; i < columnNames.size(); i++)
+        for (int i = 0; i < fields.size(); i++)
         {
             sb.append(',');
-            sb.append(ByteBufferUtil.bytesToHex(columnNames.get(i))).append(":");
-            // omit FrozenType(...) from fields because it is currently implicit
-            sb.append(columnTypes.get(i).toString(true));
+            sb.append(ByteBufferUtil.bytesToHex(fields.get(i).bytes)).append(":");
+            sb.append(columnTypes.get(i).toString(ignoreFreezing));
         }
         sb.append(')');
         return sb.toString();

@@ -17,12 +17,15 @@
  */
 package org.apache.cassandra.concurrent;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.apache.cassandra.concurrent.SEPWorker.Work;
 
@@ -34,7 +37,7 @@ import static org.apache.cassandra.concurrent.SEPWorker.Work;
  * To keep producers from incurring unnecessary delays, once an executor is "spun up" (i.e. is processing tasks at a steady
  * rate), adding tasks to the executor often involves only placing the task on the work queue and updating the
  * task permits (which imposes our max queue length constraints). Only when it cannot be guaranteed the task will be serviced
- * promptly, and the maximum concurrency has not been reached, does the producer have to schedule a thread itself to perform 
+ * promptly, and the maximum concurrency has not been reached, does the producer have to schedule a thread itself to perform
  * the work ('promptly' in this context means we already have a worker spinning for work, as described next).
  *
  * Otherwise the worker threads schedule themselves: when they are assigned a task, they will attempt to spawn
@@ -44,11 +47,11 @@ import static org.apache.cassandra.concurrent.SEPWorker.Work;
  * random interval (based upon the number of threads in this mode, so that the total amount of non-sleeping time remains
  * approximately fixed regardless of the number of spinning threads), and upon waking will again try to assign itself to
  * an executor with outstanding tasks to perform. As a result of always scheduling a partner before committing to performing
- * any work, with a steady state of task arrival we should generally have either one spinning worker ready to promptly respond 
+ * any work, with a steady state of task arrival we should generally have either one spinning worker ready to promptly respond
  * to incoming work, or all possible workers actively committed to tasks.
- * 
+ *
  * In order to prevent this executor pool acting like a noisy neighbour to other processes on the system, workers also deschedule
- * themselves when it is detected that there are too many for the current rate of operation arrival. This is decided as a function 
+ * themselves when it is detected that there are too many for the current rate of operation arrival. This is decided as a function
  * of the total time spent spinning by all workers in an interval; as more workers spin, workers are descheduled more rapidly.
  */
 public class SharedExecutorPool
@@ -61,7 +64,7 @@ public class SharedExecutorPool
     final AtomicLong workerId = new AtomicLong();
 
     // the collection of executors serviced by this pool; periodically ordered by traffic volume
-    final List<SEPExecutor> executors = new CopyOnWriteArrayList<>();
+    public final List<SEPExecutor> executors = new CopyOnWriteArrayList<>();
 
     // the number of workers currently in a spinning state
     final AtomicInteger spinningCount = new AtomicInteger();
@@ -73,6 +76,8 @@ public class SharedExecutorPool
     final ConcurrentSkipListMap<Long, SEPWorker> spinning = new ConcurrentSkipListMap<>();
     // the collection of threads that have been asked to stop/deschedule - new workers are scheduled from here last
     final ConcurrentSkipListMap<Long, SEPWorker> descheduled = new ConcurrentSkipListMap<>();
+
+    volatile boolean shuttingDown = false;
 
     public SharedExecutorPool(String poolName)
     {
@@ -103,10 +108,39 @@ public class SharedExecutorPool
             schedule(Work.SPINNING);
     }
 
-    public TracingAwareExecutorService newExecutor(int maxConcurrency, int maxQueuedTasks, String jmxPath, String name)
+    public synchronized LocalAwareExecutorService newExecutor(int maxConcurrency, String jmxPath, String name)
     {
-        SEPExecutor executor = new SEPExecutor(this, maxConcurrency, maxQueuedTasks, jmxPath, name);
+        SEPExecutor executor = new SEPExecutor(this, maxConcurrency, jmxPath, name);
         executors.add(executor);
         return executor;
+    }
+
+    public synchronized void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException
+    {
+        shuttingDown = true;
+        List<SEPExecutor> executors = new ArrayList<>(this.executors);
+        for (SEPExecutor executor : executors)
+            executor.shutdownNow();
+
+        terminateWorkers();
+
+        long until = System.nanoTime() + unit.toNanos(timeout);
+        for (SEPExecutor executor : executors)
+            executor.shutdown.await(until - System.nanoTime(), TimeUnit.NANOSECONDS);
+    }
+
+    private void terminateWorkers()
+    {
+        assert shuttingDown;
+
+        // To terminate our workers, we only need to unpark thread to make it runnable again,
+        // so that the pool.shuttingDown boolean is checked. If work was already in the process
+        // of being scheduled, worker will terminate upon running the task.
+        Map.Entry<Long, SEPWorker> e;
+        while (null != (e = descheduled.pollFirstEntry()))
+            e.getValue().assign(Work.SPINNING, false);
+
+        while (null != (e = spinning.pollFirstEntry()))
+            LockSupport.unpark(e.getValue().thread);
     }
 }

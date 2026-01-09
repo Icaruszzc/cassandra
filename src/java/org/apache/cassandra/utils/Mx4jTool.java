@@ -17,8 +17,6 @@
  */
 package org.apache.cassandra.utils;
 
-import java.lang.management.ManagementFactory;
-import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
 import org.slf4j.Logger;
@@ -28,7 +26,7 @@ import org.slf4j.LoggerFactory;
  * If mx4j-tools is in the classpath call maybeLoad to load the HTTP interface of mx4j.
  *
  * The default port is 8081. To override that provide e.g. -Dmx4jport=8082
- * The default listen address is 0.0.0.0. To override that provide -Dmx4jaddress=127.0.0.1
+ * The default listen address is the broadcast_address. To override that provide -Dmx4jaddress=127.0.0.1
  */
 public class Mx4jTool
 {
@@ -42,8 +40,8 @@ public class Mx4jTool
     {
         try
         {
-            logger.debug("Will try to load mx4j now, if it's in the classpath");
-            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            logger.trace("Will try to load mx4j now, if it's in the classpath");
+            MBeanWrapper mbs = MBeanWrapper.instance;
             ObjectName processorName = new ObjectName("Server:name=XSLTProcessor");
 
             Class<?> httpAdaptorClass = Class.forName("mx4j.tools.adaptor.http.HttpAdaptor");
@@ -65,7 +63,7 @@ public class Mx4jTool
         }
         catch (ClassNotFoundException e)
         {
-            logger.debug("Will not load MX4J, mx4j-tools.jar is not in the classpath");
+            logger.trace("Will not load MX4J, mx4j-tools.jar is not in the classpath");
         }
         catch(Exception e)
         {

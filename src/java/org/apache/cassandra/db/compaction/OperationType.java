@@ -19,6 +19,7 @@ package org.apache.cassandra.db.compaction;
 
 public enum OperationType
 {
+    /** Each modification here should be also applied to {@link org.apache.cassandra.tools.nodetool.Stop#compactionType} */
     COMPACTION("Compaction"),
     VALIDATION("Validation"),
     KEY_CACHE_SAVE("Key cache save"),
@@ -36,7 +37,10 @@ public enum OperationType
     FLUSH("Flush"),
     STREAM("Stream"),
     WRITE("Write"),
-    VIEW_BUILD("Materialized view build");
+    VIEW_BUILD("View build"),
+    INDEX_SUMMARY("Index summary redistribution"),
+    RELOCATE("Relocate sstables to correct disk"),
+    GARBAGE_COLLECT("Remove deleted data");
 
     public final String type;
     public final String fileName;

@@ -1,3 +1,189 @@
+cassandra (3.11.20) UNRELEASED; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Fri, 07 Feb 2025 07:41:47 +0100
+
+cassandra (3.11.19) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Thu, 06 Feb 2025 07:41:47 +0100
+
+cassandra (3.11.18) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Mon, 27 Jan 2025 12:16:12 +0100
+
+cassandra (3.11.17) unstable; urgency=medium
+
+  * New release
+
+ -- Brandon Williams <brandonwilliams@apache.org>  Fri, 12 Apr 2024 12:30:08 -0500
+
+cassandra (3.11.16) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Tue, 15 Aug 2023 15:25:17 +0200
+
+cassandra (3.11.15) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Fri, 28 Apr 2023 12:29:32 +0200
+
+cassandra (3.11.14) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Wed, 19 Oct 2022 10:27:23 +0200
+
+cassandra (3.11.13) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Fri, 06 May 2022 17:04:47 +0200
+
+cassandra (3.11.12) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Mon, 07 Feb 2022 13:55:35 +0100
+
+cassandra (3.11.11) unstable; urgency=medium
+
+  * New release
+
+ -- Brandon Williams <brandonwilliams@apache.org>  Sun, 25 Jul 2021 12:39:10 -0500
+
+cassandra (3.11.10) unstable; urgency=medium
+
+  * New release
+
+ -- Alex Petrov <ifesdjeen@apache.org>  Fri, 29 Jan 2021 13:27:39 +0100
+
+cassandra (3.11.9) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Thu, 29 Oct 2020 12:32:12 +0100
+
+cassandra (3.11.8) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Fri, 28 Aug 2020 15:12:12 +0200
+
+cassandra (3.11.7) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Tue, 14 Jul 2020 22:58:55 +0200
+
+cassandra (3.11.6) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Mon, 10 Feb 2020 23:54:00 +0100
+
+cassandra (3.11.5) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <mshuler@apache.org>  Thu, 24 Oct 2019 08:59:29 -0500
+
+cassandra (3.11.4) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <mshuler@apache.org>  Fri, 01 Feb 2019 12:39:21 -0600
+
+cassandra (3.11.3) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <michael@pbandjelly.org>  Mon, 02 Jul 2018 13:36:16 -0500
+
+cassandra (3.11.2) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <michael@pbandjelly.org>  Tue, 10 Oct 2017 17:18:26 -0500
+
+cassandra (3.11.1) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <michael@pbandjelly.org>  Mon, 26 Jun 2017 18:51:37 -0500
+
+cassandra (3.11.0) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <michael@pbandjelly.org>  Mon, 19 Jun 2017 17:42:32 -0500
+
+cassandra (3.10) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <michael@pbandjelly.org>  Mon, 31 Oct 2016 08:54:45 -0500
+
+cassandra (3.8) unstable; urgency=medium
+
+  * New release
+
+ -- Michael Shuler <mshuler@apache.org>  Mon, 26 Sep 2016 08:51:39 -0500
+
+cassandra (3.6) unstable; urgency=medium
+
+  * New release
+
+ -- Jake Luciani <jake@apache.org>  Tue, 03 May 2016 09:12:18 -0400
+
+cassandra (3.4) unstable; urgency=medium
+
+  * New release
+
+ -- Jake Luciani <jake@apache.org>  Mon, 29 Feb 2016 10:39:33 -0500
+
+cassandra (3.2) unstable; urgency=medium
+
+  * New release
+
+ -- Jake Luciani <jake@apache.org>  Tue, 05 Jan 2016 10:24:04 -0500
+
+cassandra (3.1) unstable; urgency=medium
+
+  * New release
+
+ -- Jake Luciani <jake@apache.org>  Fri, 04 Dec 2015 16:00:04 -0500
+
+cassandra (3.0.0) unstable; urgency=medium
+
+  * New release 
+
+ -- Jake Luciani <jake@apache.org>  Fri, 06 Nov 2015 14:37:07 -0500
+
+cassandra (3.0.0~rc2) unstable; urgency=medium
+
+  * New release candidate 
+
+ -- Jake Luciani <jake@apache.org>  Fri, 16 Oct 2015 16:02:24 -0400
+
+cassandra (3.0.0~rc1) unstable; urgency=medium
+
+  * New release candidate
+
+ -- Jake Luciani <jake@apache.org>  Sat, 19 Sep 2015 16:01:59 -0400
+
+cassandra (3.0.0~beta2) unstable; urgency=medium
+
+  * New beta release
+
+ -- Jake Luciani <jake@apache.org>  Fri, 04 Sep 2015 19:06:25 -0400
+
 cassandra (3.0.0~beta1) unstable; urgency=medium
 
   * New beta release

@@ -20,11 +20,15 @@ package org.apache.cassandra.db;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -34,15 +38,19 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.Config.DiskFailurePolicy;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.db.Directories.DataDirectory;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.service.DefaultFSErrorHandler;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
@@ -64,6 +72,10 @@ public class DirectoriesTest
     @BeforeClass
     public static void beforeClass() throws IOException
     {
+        DatabaseDescriptor.daemonInitialization();
+
+        FileUtils.setFSErrorHandler(new DefaultFSErrorHandler());
+
         for (String table : TABLES)
         {
             UUID tableID = CFMetaData.generateLegacyCfId(KS, table);
@@ -114,7 +126,7 @@ public class DirectoriesTest
 
     private static void createFakeSSTable(File dir, String cf, int gen, List<File> addTo) throws IOException
     {
-        Descriptor desc = new Descriptor(dir, KS, cf, gen);
+        Descriptor desc = new Descriptor(dir, KS, cf, gen, SSTableFormat.Type.BIG);
         for (Component c : new Component[]{ Component.DATA, Component.PRIMARY_INDEX, Component.FILTER })
         {
             File f = new File(desc.filenameFor(c));
@@ -142,19 +154,19 @@ public class DirectoriesTest
     }
 
     @Test
-    public void testStandardDirs()
+    public void testStandardDirs() throws IOException
     {
         for (CFMetaData cfm : CFM)
         {
             Directories directories = new Directories(cfm);
             assertEquals(cfDir(cfm), directories.getDirectoryForNewSSTables());
 
-            Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1);
+            Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1, SSTableFormat.Type.BIG);
             File snapshotDir = new File(cfDir(cfm),  File.separator + Directories.SNAPSHOT_SUBDIR + File.separator + "42");
-            assertEquals(snapshotDir, Directories.getSnapshotDirectory(desc, "42"));
+            assertEquals(snapshotDir.getCanonicalFile(), Directories.getSnapshotDirectory(desc, "42"));
 
             File backupsDir = new File(cfDir(cfm),  File.separator + Directories.BACKUPS_SUBDIR);
-            assertEquals(backupsDir, Directories.getBackupsDirectory(desc));
+            assertEquals(backupsDir.getCanonicalFile(), Directories.getBackupsDirectory(desc));
         }
     }
 
@@ -168,10 +180,12 @@ public class DirectoriesTest
                                   .addClusteringColumn("col", UTF8Type.instance)
                                   .build();
         ColumnDefinition col = PARENT_CFM.getColumnDefinition(ByteBufferUtil.bytes("col"));
-        IndexMetadata indexDef = IndexMetadata.singleColumnIndex(col,
-                                                                 "idx",
-                                                                 IndexMetadata.IndexType.KEYS,
-                                                                 Collections.emptyMap());
+        IndexMetadata indexDef =
+            IndexMetadata.fromIndexTargets(PARENT_CFM,
+                                           Collections.singletonList(new IndexTarget(col.name, IndexTarget.Type.VALUES)),
+                                           "idx",
+                                           IndexMetadata.Kind.KEYS,
+                                           Collections.emptyMap());
         PARENT_CFM.indexes(PARENT_CFM.getIndexes().with(indexDef));
         CFMetaData INDEX_CFM = CassandraIndex.indexCfsMetadata(PARENT_CFM, indexDef);
         Directories parentDirectories = new Directories(PARENT_CFM);
@@ -181,8 +195,8 @@ public class DirectoriesTest
         {
             assertEquals(cfDir(INDEX_CFM), dir);
         }
-        Descriptor parentDesc = new Descriptor(parentDirectories.getDirectoryForNewSSTables(), KS, PARENT_CFM.cfName, 0);
-        Descriptor indexDesc = new Descriptor(indexDirectories.getDirectoryForNewSSTables(), KS, INDEX_CFM.cfName, 0);
+        Descriptor parentDesc = new Descriptor(parentDirectories.getDirectoryForNewSSTables(), KS, PARENT_CFM.cfName, 0, SSTableFormat.Type.BIG);
+        Descriptor indexDesc = new Descriptor(indexDirectories.getDirectoryForNewSSTables(), KS, INDEX_CFM.cfName, 0, SSTableFormat.Type.BIG);
 
         // snapshot dir should be created under its parent's
         File parentSnapshotDirectory = Directories.getSnapshotDirectory(parentDesc, "test");
@@ -199,9 +213,9 @@ public class DirectoriesTest
                      indexDirectories.snapshotCreationTime("test"));
 
         // check true snapshot size
-        Descriptor parentSnapshot = new Descriptor(parentSnapshotDirectory, KS, PARENT_CFM.cfName, 0);
+        Descriptor parentSnapshot = new Descriptor(parentSnapshotDirectory, KS, PARENT_CFM.cfName, 0, SSTableFormat.Type.BIG);
         createFile(parentSnapshot.filenameFor(Component.DATA), 30);
-        Descriptor indexSnapshot = new Descriptor(indexSnapshotDirectory, KS, INDEX_CFM.cfName, 0);
+        Descriptor indexSnapshot = new Descriptor(indexSnapshotDirectory, KS, INDEX_CFM.cfName, 0, SSTableFormat.Type.BIG);
         createFile(indexSnapshot.filenameFor(Component.DATA), 40);
 
         assertEquals(30, parentDirectories.trueSnapshotsSize());
@@ -240,46 +254,76 @@ public class DirectoriesTest
         for (CFMetaData cfm : CFM)
         {
             Directories directories = new Directories(cfm);
-            Directories.SSTableLister lister;
-            Set<File> listed;
-
-            // List all but no snapshot, backup
-            lister = directories.sstableLister(Directories.OnTxnErr.THROW);
-            listed = new HashSet<>(lister.listFiles());
-            for (File f : files.get(cfm.cfName))
-            {
-                if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else
-                    assert listed.contains(f) : f + " is missing";
-            }
-
-            // List all but including backup (but no snapshot)
-            lister = directories.sstableLister(Directories.OnTxnErr.THROW).includeBackups(true);
-            listed = new HashSet<>(lister.listFiles());
-            for (File f : files.get(cfm.cfName))
-            {
-                if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else
-                    assert listed.contains(f) : f + " is missing";
-            }
-
-            // Skip temporary and compacted
-            lister = directories.sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);
-            listed = new HashSet<>(lister.listFiles());
-            for (File f : files.get(cfm.cfName))
-            {
-                if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else if (f.getName().contains("tmp-"))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else
-                    assert listed.contains(f) : f + " is missing";
-            }
+            checkFiles(cfm, directories);
         }
     }
 
+    private void checkFiles(CFMetaData cfm, Directories directories)
+    {
+        Directories.SSTableLister lister;
+        Set<File> listed;// List all but no snapshot, backup
+        lister = directories.sstableLister(Directories.OnTxnErr.THROW);
+        listed = new HashSet<>(lister.listFiles());
+        for (File f : files.get(cfm.cfName))
+        {
+            if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else
+                assertTrue(f + " is missing", listed.contains(f));
+        }
+
+        // List all but including backup (but no snapshot)
+        lister = directories.sstableLister(Directories.OnTxnErr.THROW).includeBackups(true);
+        listed = new HashSet<>(lister.listFiles());
+        for (File f : files.get(cfm.cfName))
+        {
+            if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else
+                assertTrue(f + " is missing", listed.contains(f));
+        }
+
+        // Skip temporary and compacted
+        lister = directories.sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);
+        listed = new HashSet<>(lister.listFiles());
+        for (File f : files.get(cfm.cfName))
+        {
+            if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else if (f.getName().contains("tmp-"))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else
+                assertTrue(f + " is missing", listed.contains(f));
+        }
+    }
+
+    @Test
+    public void testTemporaryFile() throws IOException
+    {
+        for (CFMetaData cfm : CFM)
+        {
+            Directories directories = new Directories(cfm);
+
+            File tempDir = directories.getTemporaryWriteableDirectoryAsFile(10);
+            tempDir.mkdir();
+            File tempFile = new File(tempDir, "tempFile");
+            tempFile.createNewFile();
+
+            assertTrue(tempDir.exists());
+            assertTrue(tempFile.exists());
+
+            //make sure temp dir/file will not affect existing sstable listing
+            checkFiles(cfm, directories);
+
+            directories.removeTemporaryDirectories();
+
+            //make sure temp dir/file deletion will not affect existing sstable listing
+            checkFiles(cfm, directories);
+
+            assertFalse(tempDir.exists());
+            assertFalse(tempFile.exists());
+        }
+    }
 
     @Test
     public void testDiskFailurePolicy_best_effort()
@@ -294,13 +338,13 @@ public class DirectoriesTest
             {
                 String[] path = new String[] {KS, "bad"};
                 File dir = new File(Directories.dataDirectories[0].location, StringUtils.join(path, File.separator));
-                FileUtils.handleFSError(new FSWriteError(new IOException("Unable to create directory " + dir), dir));
+                JVMStabilityInspector.inspectThrowable(new FSWriteError(new IOException("Unable to create directory " + dir), dir));
             }
 
             for (DataDirectory dd : Directories.dataDirectories)
             {
                 File file = new File(dd.location, new File(KS, "bad").getPath());
-                assertTrue(BlacklistedDirectories.isUnwritable(file));
+                assertTrue(DisallowedDirectories.isUnwritable(file));
             }
         } 
         finally 
@@ -319,7 +363,7 @@ public class DirectoriesTest
             final String n = Long.toString(System.nanoTime());
             Callable<File> directoryGetter = new Callable<File>() {
                 public File call() throws Exception {
-                    Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1);
+                    Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1, SSTableFormat.Type.BIG);
                     return Directories.getSnapshotDirectory(desc, n);
                 }
             };
@@ -432,6 +476,150 @@ public class DirectoriesTest
         }
     }
 
+    @Test
+    public void testGetLocationForDisk()
+    {
+        Collection<DataDirectory> paths = new ArrayList<>();
+        paths.add(new DataDirectory(new File("/tmp/aaa")));
+        paths.add(new DataDirectory(new File("/tmp/aa")));
+        paths.add(new DataDirectory(new File("/tmp/a")));
+
+        for (CFMetaData cfm : CFM)
+        {
+            Directories dirs = new Directories(cfm, paths);
+            for (DataDirectory dir : paths)
+            {
+                String p = dirs.getLocationForDisk(dir).getAbsolutePath() + File.separator;
+                assertTrue(p.startsWith(dir.location.getAbsolutePath() + File.separator));
+            }
+        }
+    }
+
+    @Test
+    public void testGetLocationWithSymlinks() throws IOException
+    {
+        Path p = Files.createTempDirectory("something");
+        Path symlinktarget = Files.createDirectories(p.resolve("symlinktarget"));
+        Path ddir = Files.createDirectories(p.resolve("datadir1"));
+
+        Path p1 = Files.createDirectories(ddir.resolve("p1").resolve("ks")).getParent(); // the data dir does not include the keyspace dir
+        Path p2 = Files.createDirectories(ddir.resolve("p2"));
+        Path l1 = Files.createSymbolicLink(p2.resolve("ks"), symlinktarget);
+
+        DataDirectory path1 = new DataDirectory(p1.toFile());
+        DataDirectory path2 = new DataDirectory(p2.toFile());
+        Directories dirs = new Directories(CFM.iterator().next(), new DataDirectory[] {path1, path2});
+        dirs.getLocationForDisk(new DataDirectory(p1.toFile()));
+        dirs.getLocationForDisk(new DataDirectory(p2.toFile()));
+
+        assertTrue(dirs.getLocationForDisk(path2).toPath().startsWith(l1));
+        assertTrue(dirs.getLocationForDisk(path1).toPath().startsWith(p1));
+    }
+
+    @Test
+    public void getDataDirectoryForFile()
+    {
+        Collection<DataDirectory> paths = new ArrayList<>();
+        paths.add(new DataDirectory(new File("/tmp/a")));
+        paths.add(new DataDirectory(new File("/tmp/aa")));
+        paths.add(new DataDirectory(new File("/tmp/aaa")));
+
+        for (CFMetaData cfm : CFM)
+        {
+            Directories dirs = new Directories(cfm, paths);
+            for (DataDirectory dir : paths)
+            {
+                Descriptor d = Descriptor.fromFilename(new File(dir.location, getNewFilename(cfm, false)).toString());
+                String p = dirs.getDataDirectoryForFile(d).location.getAbsolutePath() + File.separator;
+                assertTrue(p.startsWith(dir.location.getAbsolutePath() + File.separator));
+            }
+        }
+    }
+
+    /**
+     * Makes sure we can find the data directory when it is a symlink
+     *
+     * creates the following data directories:
+     * <tempdir something>/datadir1
+     * <tempdir something>/datadir11 (symlink to <tempdir something>/symlinktarget)
+     *
+     * and then makes sure that we get the correct directory back.
+     */
+    @Test
+    public void testDirectoriesSymlinks() throws IOException
+    {
+        Path p = Files.createTempDirectory("something");
+        Path symlinktarget = Files.createDirectories(p.resolve("symlinktarget"));
+        Path ddir1 = Files.createDirectories(p.resolve("datadir1"));
+        Path ddir2 = Files.createSymbolicLink(p.resolve("datadir11"), symlinktarget);
+        DataDirectory dd1 = new DataDirectory(ddir1.toFile());
+        DataDirectory dd2 = new DataDirectory(ddir2.toFile());
+
+        for (CFMetaData tm : CFM)
+        {
+            Directories dirs = new Directories(tm, Sets.newHashSet(dd1, dd2));
+            Descriptor desc = Descriptor.fromFilename(ddir1.resolve(getNewFilename(tm, false)).toString());
+            assertEquals(ddir1.toFile(), dirs.getDataDirectoryForFile(desc).location);
+            desc = Descriptor.fromFilename(ddir2.resolve(getNewFilename(tm, false)).toString());
+            assertEquals(ddir2.toFile(), dirs.getDataDirectoryForFile(desc).location);
+        }
+    }
+
+    @Test
+    public void testDirectoriesOldTableSymlink() throws IOException
+    {
+        testDirectoriesSymlinksHelper(true);
+    }
+
+    @Test
+    public void testDirectoriesTableSymlink() throws IOException
+    {
+        testDirectoriesSymlinksHelper(false);
+    }
+
+    /**
+     * Makes sure we can find the data directory for a file when the table directory is a symlink
+     *
+     * if oldStyle is false we append the table id to the table directory
+     *
+     * creates the following structure
+     * <tempdir>/datadir1/<ks>/<table>
+     * <tempdir>/datadir11/<ks>/<table symlink to <tempdir>/symlinktarget>
+     *
+     * and then we create a fake descriptor to a file in the table directory and make sure we get the correct
+     * data directory back.
+     */
+    private void testDirectoriesSymlinksHelper(boolean oldStyle) throws IOException
+    {
+        Path p = Files.createTempDirectory("something");
+        Path symlinktarget = Files.createDirectories(p.resolve("symlinktarget"));
+        Path ddir1 = Files.createDirectories(p.resolve("datadir1"));
+        Path ddir2 = Files.createDirectories(p.resolve("datadir11"));
+
+        for (CFMetaData metadata : CFM)
+        {
+            Path keyspacedir = Files.createDirectories(ddir2.resolve(metadata.ksName));
+            String tabledir = metadata.cfName + (oldStyle ? "" : Component.separator +  ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(metadata.cfId)));
+            Files.createSymbolicLink(keyspacedir.resolve(tabledir), symlinktarget);
+        }
+
+        DataDirectory dd1 = new DataDirectory(ddir1.toFile());
+        DataDirectory dd2 = new DataDirectory(ddir2.toFile());
+        for (CFMetaData tm : CFM)
+        {
+            Directories dirs = new Directories(tm, Sets.newHashSet(dd1, dd2));
+            Descriptor desc = Descriptor.fromFilename(ddir1.resolve(getNewFilename(tm, oldStyle)).toFile().toString());
+            assertEquals(ddir1.toFile(), dirs.getDataDirectoryForFile(desc).location);
+            desc = Descriptor.fromFilename(ddir2.resolve(getNewFilename(tm, oldStyle)).toFile().toString());
+            assertEquals(ddir2.toFile(), dirs.getDataDirectoryForFile(desc).location);
+        }
+    }
+
+    private String getNewFilename(CFMetaData metadata, boolean oldStyle)
+    {
+        return metadata.ksName + File.separator + metadata.cfName + (oldStyle ? "" : Component.separator +  ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(metadata.cfId))) + "/na-1-big-Data.db";
+    }
+
     private List<Directories.DataDirectoryCandidate> getWriteableDirectories(DataDirectory[] dataDirectories, long writeSize)
     {
         // copied from Directories.getWriteableLocation(long)
@@ -453,4 +641,5 @@ public class DirectoriesTest
 
         return candidates;
     }
+
 }

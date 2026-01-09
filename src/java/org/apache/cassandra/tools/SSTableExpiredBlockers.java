@@ -24,7 +24,6 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-import com.google.common.base.Throwables;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
 
@@ -33,7 +32,6 @@ import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -56,6 +54,9 @@ public class SSTableExpiredBlockers
             out.println("Usage: sstableexpiredblockers <keyspace> <table>");
             System.exit(1);
         }
+
+        Util.initDatabaseDescriptor();
+
         String keyspace = args[args.length - 2];
         String columnfamily = args[args.length - 1];
         Schema.instance.loadFromDisk(false);
@@ -81,8 +82,7 @@ public class SSTableExpiredBlockers
                 }
                 catch (Throwable t)
                 {
-                    out.println("Couldn't open sstable: " + sstable.getKey().filenameFor(Component.DATA));
-                    Throwables.propagate(t);
+                    out.println("Couldn't open sstable: " + sstable.getKey().filenameFor(Component.DATA)+" ("+t.getMessage()+")");
                 }
             }
         }

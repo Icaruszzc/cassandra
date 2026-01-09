@@ -22,6 +22,7 @@ import static java.lang.String.format;
 import io.airlift.command.Arguments;
 import io.airlift.command.Command;
 
+import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -34,16 +35,31 @@ import org.apache.commons.lang3.ArrayUtils;
 @Command(name = "tablehistograms", description = "Print statistic histograms for a given table")
 public class TableHistograms extends NodeToolCmd
 {
-    @Arguments(usage = "<keyspace> <table>", description = "The keyspace and table name")
+    @Arguments(usage = "<keyspace> <table> | <keyspace.table>", description = "The keyspace and table name")
     private List<String> args = new ArrayList<>();
 
     @Override
     public void execute(NodeProbe probe)
     {
-        checkArgument(args.size() == 2, "tablehistograms requires keyspace and table name arguments");
-
-        String keyspace = args.get(0);
-        String table = args.get(1);
+        PrintStream out = probe.output().out;
+        PrintStream err = probe.output().err;
+        String keyspace = null, table = null;
+        if (args.size() == 2)
+        {
+            keyspace = args.get(0);
+            table = args.get(1);
+        }
+        else if (args.size() == 1)
+        {
+            String[] input = args.get(0).split("\\.");
+            checkArgument(input.length == 2, "tablehistograms requires keyspace and table name arguments");
+            keyspace = input[0];
+            table = input[1];
+        }
+        else
+        {
+            checkArgument(false, "tablehistograms requires keyspace and table name arguments");
+        }
 
         // calculate percentile of row size and column count
         long[] estimatedPartitionSize = (long[]) probe.getColumnFamilyMetric(keyspace, table, "EstimatedPartitionSizeHistogram");
@@ -56,7 +72,7 @@ public class TableHistograms extends NodeToolCmd
 
         if (ArrayUtils.isEmpty(estimatedPartitionSize) || ArrayUtils.isEmpty(estimatedColumnCount))
         {
-            System.err.println("No SSTables exists, unable to calculate 'Partition Size' and 'Cell Count' percentiles");
+            err.println("No SSTables exists, unable to calculate 'Partition Size' and 'Cell Count' percentiles");
 
             for (int i = 0; i < 7; i++)
             {
@@ -66,14 +82,12 @@ public class TableHistograms extends NodeToolCmd
         }
         else
         {
-            long[] partitionSizeBucketOffsets = new EstimatedHistogram(estimatedPartitionSize.length).getBucketOffsets();
-            long[] columnCountBucketOffsets = new EstimatedHistogram(estimatedColumnCount.length).getBucketOffsets();
-            EstimatedHistogram partitionSizeHist = new EstimatedHistogram(partitionSizeBucketOffsets, estimatedPartitionSize);
-            EstimatedHistogram columnCountHist = new EstimatedHistogram(columnCountBucketOffsets, estimatedColumnCount);
+            EstimatedHistogram partitionSizeHist = new EstimatedHistogram(estimatedPartitionSize);
+            EstimatedHistogram columnCountHist = new EstimatedHistogram(estimatedColumnCount);
 
             if (partitionSizeHist.isOverflowed())
             {
-                System.err.println(String.format("Row sizes are larger than %s, unable to calculate percentiles", partitionSizeBucketOffsets[partitionSizeBucketOffsets.length - 1]));
+                err.println(String.format("Row sizes are larger than %s, unable to calculate percentiles", partitionSizeHist.getLargestBucketOffset()));
                 for (int i = 0; i < offsetPercentiles.length; i++)
                         estimatedRowSizePercentiles[i] = Double.NaN;
             }
@@ -85,7 +99,7 @@ public class TableHistograms extends NodeToolCmd
 
             if (columnCountHist.isOverflowed())
             {
-                System.err.println(String.format("Column counts are larger than %s, unable to calculate percentiles", columnCountBucketOffsets[columnCountBucketOffsets.length - 1]));
+                err.println(String.format("Column counts are larger than %s, unable to calculate percentiles", columnCountHist.getLargestBucketOffset()));
                 for (int i = 0; i < estimatedColumnCountPercentiles.length; i++)
                     estimatedColumnCountPercentiles[i] = Double.NaN;
             }
@@ -108,15 +122,15 @@ public class TableHistograms extends NodeToolCmd
         double[] writeLatency = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxTimerMBean) probe.getColumnFamilyMetric(keyspace, table, "WriteLatency"));
         double[] sstablesPerRead = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxHistogramMBean) probe.getColumnFamilyMetric(keyspace, table, "SSTablesPerReadHistogram"));
 
-        System.out.println(format("%s/%s histograms", keyspace, table));
-        System.out.println(format("%-10s%10s%18s%18s%18s%18s",
+        out.println(format("%s/%s histograms", keyspace, table));
+        out.println(format("%-10s%10s%18s%18s%18s%18s",
                 "Percentile", "SSTables", "Write Latency", "Read Latency", "Partition Size", "Cell Count"));
-        System.out.println(format("%-10s%10s%18s%18s%18s%18s",
+        out.println(format("%-10s%10s%18s%18s%18s%18s",
                 "", "", "(micros)", "(micros)", "(bytes)", ""));
 
         for (int i = 0; i < percentiles.length; i++)
         {
-            System.out.println(format("%-10s%10.2f%18.2f%18.2f%18.0f%18.0f",
+            out.println(format("%-10s%10.2f%18.2f%18.2f%18.0f%18.0f",
                     percentiles[i],
                     sstablesPerRead[i],
                     writeLatency[i],
@@ -124,6 +138,6 @@ public class TableHistograms extends NodeToolCmd
                     estimatedRowSizePercentiles[i],
                     estimatedColumnCountPercentiles[i]));
         }
-        System.out.println();
+        out.println();
     }
 }

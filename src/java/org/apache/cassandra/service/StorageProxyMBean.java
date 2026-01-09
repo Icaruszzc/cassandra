@@ -59,6 +59,22 @@ public interface StorageProxyMBean
     public long getReadRepairRepairedBlocking();
     public long getReadRepairRepairedBackground();
 
+    public int getOtcBacklogExpirationInterval();
+    public void setOtcBacklogExpirationInterval(int intervalInMillis);
+
     /** Returns each live node's schema version */
     public Map<String, List<String>> getSchemaVersions();
+
+    public int getNumberOfTables();
+
+    void enableSnapshotOnDuplicateRowDetection();
+    void disableSnapshotOnDuplicateRowDetection();
+    boolean getSnapshotOnDuplicateRowDetectionEnabled();
+
+    boolean getCheckForDuplicateRowsDuringReads();
+    void enableCheckForDuplicateRowsDuringReads();
+    void disableCheckForDuplicateRowsDuringReads();
+    boolean getCheckForDuplicateRowsDuringCompaction();
+    void enableCheckForDuplicateRowsDuringCompaction();
+    void disableCheckForDuplicateRowsDuringCompaction();
 }

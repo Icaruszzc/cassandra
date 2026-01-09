@@ -22,11 +22,13 @@ import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.function.BiFunction;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.Row;
@@ -36,11 +38,22 @@ import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
+/**
+ * Basic custom index implementation for testing.
+ * During indexing by default it just records the updates for later inspection.
+ * At query time, the Searcher implementation simply performs a local scan of the entire target table
+ * with no further filtering applied.
+ */
 public class StubIndex implements Index
 {
+    public volatile int beginCalls;
+    public volatile int finishCalls;
+    public List<DeletionTime> partitionDeletions = new ArrayList<>();
+    public List<RangeTombstone> rangeTombstones = new ArrayList<>();
     public List<Row> rowsInserted = new ArrayList<>();
     public List<Row> rowsDeleted = new ArrayList<>();
     public List<Pair<Row,Row>> rowsUpdated = new ArrayList<>();
+    public volatile boolean preJoinInvocation;
     private IndexMetadata indexMetadata;
     private ColumnFamilyStore baseCfs;
 
@@ -48,6 +61,9 @@ public class StubIndex implements Index
     {
         rowsInserted.clear();
         rowsDeleted.clear();
+        rowsUpdated.clear();
+        partitionDeletions.clear();
+        rangeTombstones.clear();
     }
 
     public StubIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
@@ -56,12 +72,13 @@ public class StubIndex implements Index
         this.indexMetadata = metadata;
     }
 
-    public boolean indexes(PartitionColumns columns)
+    public boolean shouldBuildBlocking()
     {
-        for (ColumnDefinition col : columns)
-            for (ColumnIdentifier indexed : indexMetadata.columns)
-                if (indexed.equals(col.name))
-                    return true;
+        return false;
+    }
+
+    public boolean dependsOn(ColumnDefinition column)
+    {
         return false;
     }
 
@@ -70,12 +87,18 @@ public class StubIndex implements Index
         return operator == Operator.EQ;
     }
 
+    public AbstractType<?> customExpressionValueType()
+    {
+        return UTF8Type.instance;
+    }
+
     public RowFilter getPostIndexQueryFilter(RowFilter filter)
     {
         return filter;
     }
 
-    public Indexer indexerFor(DecoratedKey key,
+    public Indexer indexerFor(final DecoratedKey key,
+                              PartitionColumns columns,
                               int nowInSec,
                               OpOrder.Group opGroup,
                               IndexTransaction.Type transactionType)
@@ -84,14 +107,17 @@ public class StubIndex implements Index
         {
             public void begin()
             {
+                beginCalls++;
             }
 
             public void partitionDelete(DeletionTime deletionTime)
             {
+                partitionDeletions.add(deletionTime);
             }
 
             public void rangeTombstone(RangeTombstone tombstone)
             {
+                rangeTombstones.add(tombstone);
             }
 
             public void insertRow(Row row)
@@ -111,6 +137,7 @@ public class StubIndex implements Index
 
             public void finish()
             {
+                finishCalls++;
             }
         };
     }
@@ -123,11 +150,6 @@ public class StubIndex implements Index
     public IndexMetadata getIndexMetadata()
     {
         return indexMetadata;
-    }
-
-    public String getIndexName()
-    {
-        return indexMetadata != null ? indexMetadata.name : "default_test_index_name";
     }
 
     public void register(IndexRegistry registry){
@@ -154,6 +176,14 @@ public class StubIndex implements Index
         return null;
     }
 
+    public Callable<?> getPreJoinTask(boolean hadBootstrap)
+    {
+        return () -> {
+            preJoinInvocation = true;
+            return null;
+        };
+    }
+
     public Callable<?> getInvalidateTask()
     {
         return null;
@@ -174,13 +204,13 @@ public class StubIndex implements Index
 
     }
 
-    public Searcher searcherFor(ReadCommand command)
+    public Searcher searcherFor(final ReadCommand command)
     {
-        return null;
+        return (controller) -> Util.executeLocally((PartitionRangeReadCommand)command, baseCfs, controller);
     }
 
     public BiFunction<PartitionIterator, ReadCommand, PartitionIterator> postProcessorFor(ReadCommand readCommand)
     {
-        return null;
+        return (iter, command) -> iter;
     }
 }

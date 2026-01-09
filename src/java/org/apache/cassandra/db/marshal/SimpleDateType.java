@@ -25,25 +25,14 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class SimpleDateType extends AbstractType<Integer>
 {
     public static final SimpleDateType instance = new SimpleDateType();
 
-    SimpleDateType() {} // singleton
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
-    {
-        // We add Integer.MIN_VALUE to overflow to allow unsigned comparison
-        return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
-
-    @Override
-    public boolean isByteOrderComparable()
-    {
-        return true;
-    }
+    SimpleDateType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
     public ByteBuffer fromString(String source) throws MarshalException
     {
@@ -61,15 +50,9 @@ public class SimpleDateType extends AbstractType<Integer>
     }
 
     @Override
-    public boolean isCompatibleWith(AbstractType<?> previous)
-    {
-        return super.isCompatibleWith(previous);
-    }
-
-    @Override
     public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
     {
-        return this == otherType || otherType == IntegerType.instance;
+        return this == otherType || otherType == Int32Type.instance;
     }
 
     public Term fromJSONObject(Object parsed) throws MarshalException
@@ -87,7 +70,7 @@ public class SimpleDateType extends AbstractType<Integer>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return '"' + SimpleDateSerializer.instance.toString(SimpleDateSerializer.instance.deserialize(buffer)) + '"';
     }

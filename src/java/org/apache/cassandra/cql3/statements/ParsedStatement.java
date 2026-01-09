@@ -20,9 +20,12 @@ package org.apache.cassandra.cql3.statements;
 import java.util.Collections;
 import java.util.List;
 
+import javax.annotation.Nullable;
+
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.service.ClientState;
 
 public abstract class ParsedStatement
 {
@@ -39,29 +42,50 @@ public abstract class ParsedStatement
         this.variables = new VariableSpecifications(boundNames);
     }
 
-    public abstract Prepared prepare() throws RequestValidationException;
+    public void setBoundVariables(VariableSpecifications variables)
+    {
+        this.variables = variables;
+    }
+
+    public abstract Prepared prepare(ClientState clientState) throws RequestValidationException;
 
     public static class Prepared
     {
+        /**
+         * Contains the CQL statement source if the statement has been "regularly" perpared via
+         * {@link org.apache.cassandra.cql3.QueryProcessor#prepare(java.lang.String, org.apache.cassandra.service.ClientState, boolean)} /
+         * {@link QueryHandler#prepare(java.lang.String, org.apache.cassandra.service.QueryState, java.util.Map)}.
+         * Other usages of this class may or may not contain the CQL statement source.
+         */
+        public String rawCQLStatement;
+
         public final CQLStatement statement;
         public final List<ColumnSpecification> boundNames;
-        public final Short[] partitionKeyBindIndexes;
 
-        protected Prepared(CQLStatement statement, List<ColumnSpecification> boundNames, Short[] partitionKeyBindIndexes)
+        @Nullable
+        public final short[] partitionKeyBindIndexes;
+        public final boolean fullyQualified;
+        @Nullable
+        public final String keyspace;
+
+        protected Prepared(CQLStatement statement, List<ColumnSpecification> boundNames, short[] partitionKeyBindIndexes, String keyspace, boolean fullyQualified)
         {
             this.statement = statement;
             this.boundNames = boundNames;
             this.partitionKeyBindIndexes = partitionKeyBindIndexes;
+            this.rawCQLStatement = "";
+            this.fullyQualified = fullyQualified;
+            this.keyspace = keyspace;
         }
 
-        public Prepared(CQLStatement statement, VariableSpecifications names, Short[] partitionKeyBindIndexes)
+        public Prepared(CQLStatement statement, VariableSpecifications names, short[] partitionKeyBindIndexes, String keyspace, boolean fullyQualified)
         {
-            this(statement, names.getSpecifications(), partitionKeyBindIndexes);
+            this(statement, names.getSpecifications(), partitionKeyBindIndexes, keyspace, fullyQualified);
         }
 
         public Prepared(CQLStatement statement)
         {
-            this(statement, Collections.<ColumnSpecification>emptyList(), null);
+            this(statement, Collections.<ColumnSpecification>emptyList(), null, null,false);
         }
     }
 

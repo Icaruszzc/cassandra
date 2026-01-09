@@ -22,6 +22,10 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.AbstractIterator;
 
 import org.apache.cassandra.config.CFMetaData;
@@ -32,7 +36,6 @@ import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.service.pager.QueryPager;
-import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.FBUtilities;
 
 /** a utility for doing internal cql-based queries */
@@ -51,6 +54,20 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
     public static UntypedResultSet create(SelectStatement select, QueryPager pager, int pageSize)
     {
         return new FromPager(select, pager, pageSize);
+    }
+
+    /**
+     * This method is intended for testing purposes, since it executes query on cluster
+     * and not on the local node only.
+     */
+    @VisibleForTesting
+    public static UntypedResultSet create(SelectStatement select,
+                                          ConsistencyLevel cl,
+                                          ClientState clientState,
+                                          QueryPager pager,
+                                          int pageSize)
+    {
+        return new FromDistributedPager(select, cl, clientState, pager, pageSize);
     }
 
     public boolean isEmpty()
@@ -82,7 +99,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         {
             if (cqlRows.size() != 1)
                 throw new IllegalStateException("One row required, " + cqlRows.size() + " found");
-            return new Row(cqlRows.metadata.names, cqlRows.rows.get(0));
+            return new Row(cqlRows.metadata.requestNames(), cqlRows.rows.get(0));
         }
 
         public Iterator<Row> iterator()
@@ -95,7 +112,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                 {
                     if (!iter.hasNext())
                         return endOfData();
-                    return new Row(cqlRows.metadata.names, iter.next());
+                    return new Row(cqlRows.metadata.requestNames(), iter.next());
                 }
             };
         }
@@ -103,6 +120,71 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         public List<ColumnSpecification> metadata()
         {
             return cqlRows.metadata.requestNames();
+        }
+    }
+
+    /**
+     * Pager that calls `execute` rather than `executeInternal`
+     */
+    private static class FromDistributedPager extends UntypedResultSet
+    {
+        private final SelectStatement select;
+        private final ConsistencyLevel cl;
+        private final ClientState clientState;
+        private final QueryPager pager;
+        private final int pageSize;
+        private final List<ColumnSpecification> metadata;
+
+        private FromDistributedPager(SelectStatement select,
+                                     ConsistencyLevel cl,
+                                     ClientState clientState,
+                                     QueryPager pager, int pageSize)
+        {
+            this.select = select;
+            this.cl = cl;
+            this.clientState = clientState;
+            this.pager = pager;
+            this.pageSize = pageSize;
+            this.metadata = select.getResultMetadata().requestNames();
+        }
+
+        public int size()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public Row one()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public Iterator<Row> iterator()
+        {
+            return new AbstractIterator<Row>()
+            {
+                private Iterator<List<ByteBuffer>> currentPage;
+
+                protected Row computeNext()
+                {
+                    int nowInSec = FBUtilities.nowInSeconds();
+                    while (currentPage == null || !currentPage.hasNext())
+                    {
+                        if (pager.isExhausted())
+                            return endOfData();
+
+                        try (PartitionIterator iter = pager.fetchPage(pageSize, cl, clientState, System.nanoTime()))
+                        {
+                            currentPage = select.process(iter, nowInSec).rows.iterator();
+                        }
+                    }
+                    return new Row(metadata, currentPage.next());
+                }
+            };
+        }
+
+        public List<ColumnSpecification> metadata()
+        {
+            return metadata;
         }
     }
 
@@ -160,7 +242,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
             this.select = select;
             this.pager = pager;
             this.pageSize = pageSize;
-            this.metadata = select.getResultMetadata().names;
+            this.metadata = select.getResultMetadata().requestNames();
         }
 
         public int size()
@@ -187,7 +269,8 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                         if (pager.isExhausted())
                             return endOfData();
 
-                        try (ReadOrderGroup orderGroup = pager.startOrderGroup(); PartitionIterator iter = pager.fetchPageInternal(pageSize, orderGroup))
+                        try (ReadExecutionController executionController = pager.executionController();
+                             PartitionIterator iter = pager.fetchPageInternal(pageSize, executionController))
                         {
                             currentPage = select.process(iter, nowInSec).rows.iterator();
                         }
@@ -244,7 +327,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                 {
                     ComplexColumnData complexData = row.getComplexColumnData(def);
                     if (complexData != null)
-                        data.put(def.name.toString(), ((CollectionType)def.type).serializeForNativeProtocol(def, complexData.iterator(), Server.VERSION_3));
+                        data.put(def.name.toString(), ((CollectionType)def.type).serializeForNativeProtocol(complexData.iterator(), ProtocolVersion.V3));
                 }
             }
 
@@ -295,6 +378,16 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         public ByteBuffer getBytes(String column)
         {
             return data.get(column);
+        }
+
+        public byte[] getByteArray(String column)
+        {
+            ByteBuffer buf = data.get(column);
+            byte[] arr = new byte[buf.remaining()];
+            for (int i = 0; i < arr.length; i++)
+                arr[i] = buf.get(buf.position() + i);
+
+            return arr;
         }
 
         public InetAddress getInetAddress(String column)

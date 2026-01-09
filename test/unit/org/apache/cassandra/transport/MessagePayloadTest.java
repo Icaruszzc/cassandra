@@ -29,7 +29,6 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.BatchQueryOptions;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryHandler;
@@ -38,7 +37,6 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.BatchStatement;
 import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.cql3.CQLTester;
-import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
@@ -193,7 +191,7 @@ public class MessagePayloadTest extends CQLTester
 
             Assert.assertSame(TestQueryHandler.class, ClientState.getCQLQueryHandler().getClass());
 
-            SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, Server.VERSION_3);
+            SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, ProtocolVersion.V3);
             try
             {
                 client.connect(false);
@@ -218,6 +216,10 @@ public class MessagePayloadTest extends CQLTester
                 {
                     Assert.assertTrue(e.getCause() instanceof ProtocolException);
                 }
+                // when a protocol exception is thrown by the server the connection is closed, so need to re-connect
+                client.close();
+                client.connect(false);
+
                 queryMessage.setCustomPayload(null);
                 client.execute(queryMessage);
 
@@ -233,6 +235,10 @@ public class MessagePayloadTest extends CQLTester
                 {
                     Assert.assertTrue(e.getCause() instanceof ProtocolException);
                 }
+                // when a protocol exception is thrown by the server the connection is closed, so need to re-connect
+                client.close();
+                client.connect(false);
+
                 prepareMessage.setCustomPayload(null);
                 ResultMessage.Prepared prepareResponse = (ResultMessage.Prepared) client.execute(prepareMessage);
 
@@ -249,6 +255,9 @@ public class MessagePayloadTest extends CQLTester
                 {
                     Assert.assertTrue(e.getCause() instanceof ProtocolException);
                 }
+                // when a protocol exception is thrown by the server the connection is closed, so need to re-connect
+                client.close();
+                client.connect(false);
 
                 BatchMessage batchMessage = new BatchMessage(BatchStatement.Type.UNLOGGED,
                                                              Collections.<Object>singletonList("INSERT INTO " + KEYSPACE + ".atable (pk,v) VALUES (1, 'foo')"),
@@ -318,12 +327,13 @@ public class MessagePayloadTest extends CQLTester
         public ResultMessage process(String query,
                                      QueryState state,
                                      QueryOptions options,
-                                     Map<String, ByteBuffer> customPayload)
-                                             throws RequestExecutionException, RequestValidationException
+                                     Map<String, ByteBuffer> customPayload,
+                                     long queryStartNanoTime)
+                                            throws RequestExecutionException, RequestValidationException
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.process(query, state, options, customPayload);
+            ResultMessage result = QueryProcessor.instance.process(query, state, options, customPayload, queryStartNanoTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);
@@ -335,12 +345,13 @@ public class MessagePayloadTest extends CQLTester
         public ResultMessage processBatch(BatchStatement statement,
                                           QueryState state,
                                           BatchQueryOptions options,
-                                          Map<String, ByteBuffer> customPayload)
+                                          Map<String, ByteBuffer> customPayload,
+                                          long queryStartNanoTime)
                                                   throws RequestExecutionException, RequestValidationException
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.processBatch(statement, state, options, customPayload);
+            ResultMessage result = QueryProcessor.instance.processBatch(statement, state, options, customPayload, queryStartNanoTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);
@@ -352,12 +363,13 @@ public class MessagePayloadTest extends CQLTester
         public ResultMessage processPrepared(CQLStatement statement,
                                              QueryState state,
                                              QueryOptions options,
-                                             Map<String, ByteBuffer> customPayload)
-                                                     throws RequestExecutionException, RequestValidationException
+                                             Map<String, ByteBuffer> customPayload,
+                                             long queryStartNanoTime)
+                                                    throws RequestExecutionException, RequestValidationException
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.processPrepared(statement, state, options, customPayload);
+            ResultMessage result = QueryProcessor.instance.processPrepared(statement, state, options, customPayload, queryStartNanoTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);

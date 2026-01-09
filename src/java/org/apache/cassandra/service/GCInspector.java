@@ -33,21 +33,26 @@ import javax.management.NotificationListener;
 import javax.management.ObjectName;
 import javax.management.openmbean.CompositeData;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.sun.management.GarbageCollectionNotificationInfo;
 import com.sun.management.GcInfo;
 
-import org.apache.cassandra.db.lifecycle.TransactionLog;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.StatusLogger;
 
 public class GCInspector implements NotificationListener, GCInspectorMXBean
 {
     public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
-    final static long MIN_LOG_DURATION = 200;
-    final static long MIN_LOG_DURATION_TPSTATS = 1000;
+    final static long MIN_LOG_DURATION = DatabaseDescriptor.getGCLogThreshold();
+    final static long GC_WARN_THRESHOLD_IN_MS = DatabaseDescriptor.getGCWarnThreshold();
+    final static long STAT_THRESHOLD = GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION;
+
     /*
      * The field from java.nio.Bits that tracks the total number of allocated
      * bytes of direct memory requires via ByteBuffer.allocateDirect that have not been GCed.
@@ -132,18 +137,17 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
 
     public GCInspector()
     {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-
         try
         {
             ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
-            for (ObjectName name : mbs.queryNames(gcName, null))
+            for (ObjectName name : MBeanWrapper.instance.queryNames(gcName, null))
             {
-                GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(mbs, name.getCanonicalName(), GarbageCollectorMXBean.class);
+                GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(MBeanWrapper.instance.getMBeanServer(), name.getCanonicalName(), GarbageCollectorMXBean.class);
                 gcStates.put(gc.getName(), new GCState(gc, assumeGCIsPartiallyConcurrent(gc), assumeGCIsOldGen(gc)));
             }
-
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+            ObjectName me = new ObjectName(MBEAN_NAME);
+            if (!MBeanWrapper.instance.isRegistered(me))
+                MBeanWrapper.instance.registerMBean(this, me);
         }
         catch (Exception e)
         {
@@ -274,17 +278,19 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
             }
 
             String st = sb.toString();
-            if (duration > MIN_LOG_DURATION)
+            if (GC_WARN_THRESHOLD_IN_MS != 0 && duration > GC_WARN_THRESHOLD_IN_MS)
+                logger.warn(st);
+            else if (duration > MIN_LOG_DURATION)
                 logger.info(st);
-            else if (logger.isDebugEnabled())
-                logger.debug(st);
+            else if (logger.isTraceEnabled())
+                logger.trace(st);
 
-            if (duration > MIN_LOG_DURATION_TPSTATS)
+            if (duration > STAT_THRESHOLD)
                 StatusLogger.log();
 
             // if we just finished an old gen collection and we're still using a lot of memory, try to reduce the pressure
             if (gcState.assumeGCIsOldGen)
-                TransactionLog.rescheduleFailedDeletions();
+                LifecycleTransaction.rescheduleFailedDeletions();
         }
     }
 

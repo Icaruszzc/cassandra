@@ -25,12 +25,13 @@ public class Connection
     static final AttributeKey<Connection> attributeKey = AttributeKey.valueOf("CONN");
 
     private final Channel channel;
-    private final int version;
+    private final ProtocolVersion version;
     private final Tracker tracker;
 
     private volatile FrameCompressor frameCompressor;
+    private boolean throwOnOverload;
 
-    public Connection(Channel channel, int version, Tracker tracker)
+    public Connection(Channel channel, ProtocolVersion version, Tracker tracker)
     {
         this.channel = channel;
         this.version = version;
@@ -49,12 +50,22 @@ public class Connection
         return frameCompressor;
     }
 
+    public void setThrowOnOverload(boolean throwOnOverload)
+    {
+        this.throwOnOverload = throwOnOverload;
+    }
+
+    public boolean isThrowOnOverload()
+    {
+        return throwOnOverload;
+    }
+
     public Tracker getTracker()
     {
         return tracker;
     }
 
-    public int getVersion()
+    public ProtocolVersion getVersion()
     {
         return version;
     }
@@ -66,7 +77,7 @@ public class Connection
 
     public interface Factory
     {
-        Connection newConnection(Channel channel, int version);
+        Connection newConnection(Channel channel, ProtocolVersion version);
     }
 
     public interface Tracker

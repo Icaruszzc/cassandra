@@ -21,8 +21,7 @@ import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-
-import com.google.common.base.Joiner;
+import java.util.stream.Collectors;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.functions.Function;
@@ -32,9 +31,8 @@ import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Static helper methods and classes for sets.
@@ -45,10 +43,20 @@ public abstract class Sets
 
     public static ColumnSpecification valueSpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((SetType)column.type).getElementsType());
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), elementsType(column.type));
     }
 
-    public static class Literal implements Term.Raw
+    private static AbstractType<?> unwrap(AbstractType<?> type)
+    {
+        return type.isReversed() ? unwrap(((ReversedType<?>) type).baseType) : type;
+    }
+
+    private static AbstractType<?> elementsType(AbstractType<?> type)
+    {
+        return ((SetType) unwrap(type)).getElementsType();
+    }
+
+    public static class Literal extends Term.Raw
     {
         private final List<Term.Raw> elements;
 
@@ -64,7 +72,7 @@ public abstract class Sets
             // We've parsed empty maps as a set literal to break the ambiguity so
             // handle that case now
             if (receiver.type instanceof MapType && elements.isEmpty())
-                return new Maps.Value(Collections.<ByteBuffer, ByteBuffer>emptyMap());
+                return new Maps.Value(Collections.emptySortedMap());
 
             ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
             Set<Term> values = new HashSet<>(elements.size());
@@ -81,17 +89,19 @@ public abstract class Sets
 
                 values.add(t);
             }
-            DelayedValue value = new DelayedValue(((SetType)receiver.type).getElementsType(), values);
+            DelayedValue value = new DelayedValue(elementsType(receiver.type), values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
         private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (!(receiver.type instanceof SetType))
+            AbstractType<?> type = unwrap(receiver.type);
+
+            if (!(type instanceof SetType))
             {
                 // We've parsed empty maps as a set literal to break the ambiguity so
                 // handle that case now
-                if ((receiver.type instanceof MapType) && elements.isEmpty())
+                if ((type instanceof MapType) && elements.isEmpty())
                     return;
 
                 throw new InvalidRequestException(String.format("Invalid set literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
@@ -125,9 +135,20 @@ public abstract class Sets
         }
 
         @Override
-        public String toString()
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            return "{" + Joiner.on(", ").join(elements) + "}";
+            for (Term.Raw term : elements)
+            {
+                AbstractType<?> type = term.getExactTypeIfKnown(keyspace);
+                if (type != null)
+                    return SetType.getInstance(type, false);
+            }
+            return null;
+        }
+
+        public String getText()
+        {
+            return elements.stream().map(Term.Raw::getText).collect(Collectors.joining(", ", "{", "}"));
         }
     }
 
@@ -140,7 +161,7 @@ public abstract class Sets
             this.elements = elements;
         }
 
-        public static Value fromSerialized(ByteBuffer value, SetType type, int version) throws InvalidRequestException
+        public static Value fromSerialized(ByteBuffer value, SetType type, ProtocolVersion version) throws InvalidRequestException
         {
             try
             {
@@ -158,7 +179,7 @@ public abstract class Sets
             }
         }
 
-        public ByteBuffer get(int protocolVersion)
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             return CollectionSerializer.pack(elements, elements.size(), protocolVersion);
         }
@@ -213,20 +234,14 @@ public abstract class Sets
                 if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                     return UNSET_VALUE;
 
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (bytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("Set value is too long. Set values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    bytes.remaining()));
-
                 buffers.add(bytes);
             }
             return new Value(buffers);
         }
 
-        public Iterable<Function> getFunctions()
+        public void addFunctionsTo(List<Function> functions)
         {
-            return Terms.getFunctions(elements);
+            Terms.addFunctions(elements, functions);
         }
     }
 
@@ -305,7 +320,7 @@ public abstract class Sets
                 if (value == null)
                     params.addTombstone(column);
                 else
-                    params.addCell(column, value.get(Server.CURRENT_VERSION));
+                    params.addCell(column, value.get(ProtocolVersion.CURRENT));
             }
         }
     }

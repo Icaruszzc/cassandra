@@ -26,23 +26,29 @@ import java.nio.channels.ReadableByteChannel;
 import java.util.zip.Checksum;
 import java.util.Set;
 
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import net.jpountz.lz4.LZ4BlockInputStream;
 import net.jpountz.lz4.LZ4FastDecompressor;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.xxhash.XXHashFactory;
 
 import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.EncryptionOptions;
 import org.xerial.snappy.SnappyInputStream;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.UnknownColumnFamilyException;
+import org.apache.cassandra.db.monitoring.ApproximateTime;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
 import org.apache.cassandra.io.util.NIODataInputStream;
 
-public class IncomingTcpConnection extends Thread implements Closeable
+public class IncomingTcpConnection extends FastThreadLocalThread implements Closeable
 {
     private static final Logger logger = LoggerFactory.getLogger(IncomingTcpConnection.class);
 
@@ -61,7 +67,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         this.compressed = compressed;
         this.socket = socket;
         this.group = group;
-        if (DatabaseDescriptor.getInternodeRecvBufferSize() != null)
+        if (DatabaseDescriptor.getInternodeRecvBufferSize() > 0)
         {
             try
             {
@@ -102,7 +108,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.debug("IOException reading from socket; closing", e);
+            logger.trace("IOException reading from socket; closing", e);
         }
         finally
         {
@@ -115,6 +121,8 @@ public class IncomingTcpConnection extends Thread implements Closeable
     {
         try
         {
+            if (logger.isTraceEnabled())
+                logger.trace("Closing socket {} - isclosed: {}", socket, socket.isClosed());
             if (!socket.isClosed())
             {
                 socket.close();
@@ -122,7 +130,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         catch (IOException e)
         {
-            logger.debug("Error closing socket", e);
+            logger.trace("Error closing socket", e);
         }
         finally
         {
@@ -130,6 +138,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
     }
 
+    @SuppressWarnings("resource") // Not closing constructed DataInputPlus's as the stream needs to remain open.
     private void receiveMessages() throws IOException
     {
         // handshake (true) endpoint versions
@@ -138,18 +147,29 @@ public class IncomingTcpConnection extends Thread implements Closeable
         // to connect with, the other node will disconnect
         out.writeInt(MessagingService.current_version);
         out.flush();
+
+        // outbound side will reconnect if necessary to upgrade version
+        if (version > MessagingService.current_version)
+            throw new IOException("Peer-used messaging version " + version + " is larger than max supported " + MessagingService.current_version);
+
         DataInputPlus in = new DataInputStreamPlus(socket.getInputStream());
         int maxVersion = in.readInt();
-        // outbound side will reconnect if necessary to upgrade version
-        assert version <= MessagingService.current_version;
         from = CompactEndpointSerializationHelper.deserialize(in);
+
+        if (isEncryptionRequired(from) && !isEncrypted())
+        {
+            logger.warn("Peer {} attempted to establish an unencrypted connection (broadcast address {})",
+                        socket.getRemoteSocketAddress(), from);
+            throw new IOException("Peer " + from + " attempted an unencrypted connection");
+        }
+
         // record the (true) version of the endpoint
         MessagingService.instance().setVersion(from, maxVersion);
-        logger.debug("Set version for {} to {} (will use {})", from, maxVersion, MessagingService.instance().getVersion(from));
+        logger.trace("Set version for {} to {} (will use {})", from, maxVersion, MessagingService.instance().getVersion(from));
 
         if (compressed)
         {
-            logger.debug("Upgrading incoming connection to be compressed");
+            logger.trace("Upgrading incoming connection to be compressed");
             if (version < MessagingService.VERSION_21)
             {
                 in = new DataInputStreamPlus(new SnappyInputStream(socket.getInputStream()));
@@ -183,19 +203,8 @@ public class IncomingTcpConnection extends Thread implements Closeable
             id = Integer.parseInt(input.readUTF());
         else
             id = input.readInt();
-
-        long timestamp = System.currentTimeMillis();
-        boolean isCrossNodeTimestamp = false;
-        // make sure to readInt, even if cross_node_to is not enabled
-        int partial = input.readInt();
-        if (DatabaseDescriptor.hasCrossNodeTimeout())
-        {
-            long crossNodeTimestamp = (timestamp & 0xFFFFFFFF00000000L) | (((partial & 0xFFFFFFFFL) << 2) >> 2);
-            isCrossNodeTimestamp = (timestamp != crossNodeTimestamp);
-            timestamp = crossNodeTimestamp;
-        }
-
-        MessageIn message = MessageIn.read(input, version, id);
+        long currentTime = ApproximateTime.currentTimeMillis();
+        MessageIn message = MessageIn.read(input, version, id, MessageIn.readConstructionTime(from, input, currentTime));
         if (message == null)
         {
             // callback expired; nothing to do
@@ -203,12 +212,22 @@ public class IncomingTcpConnection extends Thread implements Closeable
         }
         if (version <= MessagingService.current_version)
         {
-            MessagingService.instance().receive(message, id, timestamp, isCrossNodeTimestamp);
+            MessagingService.instance().receive(message, id);
         }
         else
         {
-            logger.debug("Received connection from newer protocol version {}. Ignoring message", version);
+            logger.trace("Received connection from newer protocol version {}. Ignoring message", version);
         }
         return message.from;
+    }
+
+    private boolean isEncryptionRequired(InetAddress peer)
+    {
+        return DatabaseDescriptor.getServerEncryptionOptions().shouldEncrypt(peer);
+    }
+
+    private boolean isEncrypted()
+    {
+        return socket instanceof SSLSocket;
     }
 }

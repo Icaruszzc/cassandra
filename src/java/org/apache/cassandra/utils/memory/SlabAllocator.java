@@ -31,9 +31,9 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 import sun.nio.ch.DirectBuffer;
 
 /**
- * The SlabAllocator is a bump-the-pointer allocator that allocates
- * large (2MB by default) regions and then doles them out to threads that request
- * slices into the array.
++ * The SlabAllocator is a bump-the-pointer allocator that allocates
++ * large (1MB) global regions and then doles them out to threads that
++ * request smaller sized (up to 128kb) slices into the array.
  * <p></p>
  * The purpose of this class is to combat heap fragmentation in long lived
  * objects: by ensuring that all allocations with similar lifetimes
@@ -59,13 +59,20 @@ public class SlabAllocator extends MemtableBufferAllocator
 
     // this queue is used to keep references to off-heap allocated regions so that we can free them when we are discarded
     private final ConcurrentLinkedQueue<Region> offHeapRegions = new ConcurrentLinkedQueue<>();
-    private AtomicLong unslabbedSize = new AtomicLong(0);
+    private final AtomicLong unslabbedSize = new AtomicLong(0);
     private final boolean allocateOnHeapOnly;
+    private final EnsureOnHeap ensureOnHeap;
 
     SlabAllocator(SubAllocator onHeap, SubAllocator offHeap, boolean allocateOnHeapOnly)
     {
         super(onHeap, offHeap);
         this.allocateOnHeapOnly = allocateOnHeapOnly;
+        this.ensureOnHeap = allocateOnHeapOnly ? new EnsureOnHeap.NoOp() : new EnsureOnHeap.CloneToHeap();
+    }
+
+    public EnsureOnHeap ensureOnHeap()
+    {
+        return ensureOnHeap;
     }
 
     public ByteBuffer allocate(int size)
@@ -104,11 +111,6 @@ public class SlabAllocator extends MemtableBufferAllocator
             // not enough space!
             currentRegion.compareAndSet(region, null);
         }
-    }
-
-    public DataReclaimer reclaimer()
-    {
-        return NO_OP;
     }
 
     public void setDiscarded()
@@ -168,18 +170,13 @@ public class SlabAllocator extends MemtableBufferAllocator
         /**
          * Actual underlying data
          */
-        private ByteBuffer data;
+        private final ByteBuffer data;
 
         /**
          * Offset for the next allocation, or the sentinel value -1
          * which implies that the region is still uninitialized.
          */
-        private AtomicInteger nextFreeOffset = new AtomicInteger(0);
-
-        /**
-         * Total number of allocations satisfied from this buffer
-         */
-        private AtomicInteger allocCount = new AtomicInteger();
+        private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
 
         /**
          * Create an uninitialized region. Note that memory is not allocated yet, so
@@ -199,30 +196,20 @@ public class SlabAllocator extends MemtableBufferAllocator
          */
         public ByteBuffer allocate(int size)
         {
-            while (true)
-            {
-                int oldOffset = nextFreeOffset.get();
+            int newOffset = nextFreeOffset.getAndAdd(size);
 
-                if (oldOffset + size > data.capacity()) // capacity == remaining
-                    return null;
+            if (newOffset + size > data.capacity())
+                // this region is full
+                return null;
 
-                // Try to atomically claim this region
-                if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))
-                {
-                    // we got the alloc
-                    allocCount.incrementAndGet();
-                    return (ByteBuffer) data.duplicate().position(oldOffset).limit(oldOffset + size);
-                }
-                // we raced and lost alloc, try again
-            }
+            return (ByteBuffer) data.duplicate().position((newOffset)).limit(newOffset + size);
         }
 
         @Override
         public String toString()
         {
             return "Region@" + System.identityHashCode(this) +
-                   " allocs=" + allocCount.get() + "waste=" +
-                   (data.capacity() - nextFreeOffset.get());
+                   "waste=" + Math.max(0, data.capacity() - nextFreeOffset.get());
         }
     }
 }

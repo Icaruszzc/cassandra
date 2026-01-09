@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from collections import defaultdict
 
 RED = '\033[0;1;31m'
@@ -27,12 +26,23 @@ WHITE = '\033[0;1;37m'
 DARK_MAGENTA = '\033[0;35m'
 ANSI_RESET = '\033[0m'
 
+
 def colorme(bval, colormap, colorkey):
+    if colormap is NO_COLOR_MAP:
+        return bval
     if colormap is None:
         colormap = DEFAULT_VALUE_COLORS
     return FormattedValue(bval, colormap[colorkey] + bval + colormap['reset'])
 
+
+def get_str(val):
+    if isinstance(val, FormattedValue):
+        return val.strval
+    return val
+
+
 class FormattedValue:
+
     def __init__(self, strval, coloredval=None, displaywidth=None):
         self.strval = strval
         if coloredval is None:
@@ -89,6 +99,7 @@ class FormattedValue:
         """
         return self.coloredval + self._pad(width, fill)
 
+
 DEFAULT_VALUE_COLORS = dict(
     default=YELLOW,
     text=YELLOW,
@@ -103,12 +114,15 @@ DEFAULT_VALUE_COLORS = dict(
     inet=GREEN,
     boolean=GREEN,
     uuid=GREEN,
+    duration=GREEN,
     collection=BLUE,
     reset=ANSI_RESET,
 )
 
 COLUMN_NAME_COLORS = defaultdict(lambda: MAGENTA,
-    error=RED,
-    blob=DARK_MAGENTA,
-    reset=ANSI_RESET,
-)
+                                 error=RED,
+                                 blob=DARK_MAGENTA,
+                                 reset=ANSI_RESET,
+                                 )
+
+NO_COLOR_MAP = dict()

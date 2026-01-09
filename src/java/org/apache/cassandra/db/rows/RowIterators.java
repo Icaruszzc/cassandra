@@ -17,14 +17,16 @@
  */
 package org.apache.cassandra.db.rows;
 
-import java.util.*;
+import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -36,65 +38,51 @@ public abstract class RowIterators
 
     private RowIterators() {}
 
-    public static void digest(RowIterator iterator, MessageDigest digest)
+    public static void digest(RowIterator iterator, MessageDigest digest, MessageDigest altDigest, Set<ByteBuffer> columnsToExclude)
     {
-        // TODO: we're not computing digest the same way that old nodes so we'll need
-        // to pass the version we're computing the digest for and deal with that.
+        // TODO: we're not computing digest the same way that old nodes. This is
+        // currently ok as this is only used for schema digest and the is no exchange
+        // of schema digest between different versions. If this changes however,
+        // we'll need to agree on a version.
         digest.update(iterator.partitionKey().getKey().duplicate());
-        iterator.columns().digest(digest);
+        iterator.columns().regulars.digest(digest);
+        iterator.columns().statics.digest(digest);
         FBUtilities.updateWithBoolean(digest, iterator.isReverseOrder());
         iterator.staticRow().digest(digest);
 
-        while (iterator.hasNext())
-            iterator.next().digest(digest);
-    }
-
-    public static RowIterator emptyIterator(CFMetaData cfm, DecoratedKey partitionKey, boolean isReverseOrder)
-    {
-        return iterator(cfm, partitionKey, isReverseOrder, Collections.emptyIterator());
-    }
-
-    public static RowIterator iterator(CFMetaData cfm, DecoratedKey partitionKey, boolean isReverseOrder, Iterator<Row> iterator)
-    {
-        return new RowIterator()
+        if (altDigest != null)
         {
-            public CFMetaData metadata()
-            {
-                return cfm;
-            }
+            // Compute the "alternative digest" here.
+            altDigest.update(iterator.partitionKey().getKey().duplicate());
+            iterator.columns().regulars.digest(altDigest, columnsToExclude);
+            iterator.columns().statics.digest(altDigest, columnsToExclude);
+            FBUtilities.updateWithBoolean(altDigest, iterator.isReverseOrder());
+            iterator.staticRow().digest(altDigest, columnsToExclude);
+        }
 
-            public boolean isReverseOrder()
-            {
-                return isReverseOrder;
-            }
+        while (iterator.hasNext())
+        {
+            Row row = iterator.next();
+            row.digest(digest);
+            if (altDigest != null)
+                row.digest(altDigest, columnsToExclude);
+        }
+    }
 
-            public PartitionColumns columns()
-            {
-                return PartitionColumns.NONE;
-            }
+    /**
+     * Filter the provided iterator to only include cells that are selected by the user.
+     *
+     * @param iterator the iterator to filter.
+     * @param filter the {@code ColumnFilter} to use when deciding which cells are queried by the user. This should be the filter
+     * that was used when querying {@code iterator}.
+     * @return the filtered iterator..
+     */
+    public static RowIterator withOnlyQueriedData(RowIterator iterator, ColumnFilter filter)
+    {
+        if (filter.allFetchedColumnsAreQueried())
+            return iterator;
 
-            public DecoratedKey partitionKey()
-            {
-                return partitionKey;
-            }
-
-            public Row staticRow()
-            {
-                return Rows.EMPTY_STATIC_ROW;
-            }
-
-            public void close() { }
-
-            public boolean hasNext()
-            {
-                return iterator.hasNext();
-            }
-
-            public Row next()
-            {
-                return iterator.next();
-            }
-        };
+        return Transformation.apply(iterator, new WithOnlyQueriedData(filter));
     }
 
     /**
@@ -113,24 +101,23 @@ public abstract class RowIterators
                     metadata.getKeyValidator().getString(iterator.partitionKey().getKey()),
                     iterator.isReverseOrder());
 
-        return new WrappingRowIterator(iterator)
+        class Log extends Transformation
         {
             @Override
-            public Row staticRow()
+            public Row applyToStatic(Row row)
             {
-                Row row = super.staticRow();
                 if (!row.isEmpty())
-                    logger.info("[{}] {}", id, row.toString(metadata()));
+                    logger.info("[{}] {}", id, row.toString(metadata));
                 return row;
             }
 
             @Override
-            public Row next()
+            public Row applyToRow(Row row)
             {
-                Row next = super.next();
-                logger.info("[{}] {}", id, next.toString(metadata()));
-                return next;
+                logger.info("[{}] {}", id, row.toString(metadata));
+                return row;
             }
-        };
+        }
+        return Transformation.apply(iterator, new Log());
     }
 }

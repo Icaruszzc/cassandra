@@ -21,20 +21,33 @@ import java.io.DataInput;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
+import javax.crypto.Cipher;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.utils.Hex;
 import org.json.simple.JSONValue;
 
 import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
@@ -47,8 +60,13 @@ import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
  */
 final class HintsDescriptor
 {
+    private static final Logger logger = LoggerFactory.getLogger(HintsDescriptor.class);
+
     static final int VERSION_30 = 1;
     static final int CURRENT_VERSION = VERSION_30;
+
+    static final String COMPRESSION = "compression";
+    static final String ENCRYPTION = "encryption";
 
     static final Pattern pattern =
         Pattern.compile("^[a-fA-F0-9]{8}\\-[a-fA-F0-9]{4}\\-[a-fA-F0-9]{4}\\-[a-fA-F0-9]{4}\\-[a-fA-F0-9]{12}\\-(\\d+)\\-(\\d+)\\.hints$");
@@ -57,20 +75,125 @@ final class HintsDescriptor
     final int version;
     final long timestamp;
 
-    // implemented for future compression support - see CASSANDRA-9428
     final ImmutableMap<String, Object> parameters;
+    final ParameterizedClass compressionConfig;
+
+    private final Cipher cipher;
+    private final ICompressor compressor;
 
     HintsDescriptor(UUID hostId, int version, long timestamp, ImmutableMap<String, Object> parameters)
     {
         this.hostId = hostId;
         this.version = version;
         this.timestamp = timestamp;
+        compressionConfig = createCompressionConfig(parameters);
+
+        EncryptionData encryption = createEncryption(parameters);
+        if (encryption == null)
+        {
+            cipher = null;
+            compressor = null;
+        }
+        else
+        {
+            if (compressionConfig != null)
+                throw new IllegalStateException("a hints file cannot be configured for both compression and encryption");
+            cipher = encryption.cipher;
+            compressor = encryption.compressor;
+            parameters = encryption.params;
+        }
+
         this.parameters = parameters;
+    }
+
+    HintsDescriptor(UUID hostId, long timestamp, ImmutableMap<String, Object> parameters)
+    {
+        this(hostId, CURRENT_VERSION, timestamp, parameters);
     }
 
     HintsDescriptor(UUID hostId, long timestamp)
     {
         this(hostId, CURRENT_VERSION, timestamp, ImmutableMap.<String, Object>of());
+    }
+
+    @SuppressWarnings("unchecked")
+    static ParameterizedClass createCompressionConfig(Map<String, Object> params)
+    {
+        if (params.containsKey(COMPRESSION))
+        {
+            Map<String, Object> compressorConfig = (Map<String, Object>) params.get(COMPRESSION);
+            return new ParameterizedClass((String) compressorConfig.get(ParameterizedClass.CLASS_NAME),
+                                          (Map<String, String>) compressorConfig.get(ParameterizedClass.PARAMETERS));
+        }
+        else
+        {
+            return null;
+        }
+    }
+
+    /**
+     * Create, if necessary, the required encryption components (for either decrpyt or encrypt operations).
+     * Note that in the case of encyption (this is, when writing out a new hints file), we need to write
+     * the cipher's IV out to the header so it can be used when decrypting. Thus, we need to add an additional
+     * entry to the {@code params} map.
+     *
+     * @param params the base parameters into the descriptor.
+     * @return null if not using encryption; else, the initialized {@link Cipher} and a possibly updated version
+     * of the {@code params} map.
+     */
+    @SuppressWarnings("unchecked")
+    static EncryptionData createEncryption(ImmutableMap<String, Object> params)
+    {
+        if (params.containsKey(ENCRYPTION))
+        {
+            Map<?, ?> encryptionConfig = (Map<?, ?>) params.get(ENCRYPTION);
+            EncryptionContext encryptionContext = EncryptionContext.createFromMap(encryptionConfig, DatabaseDescriptor.getEncryptionContext());
+
+            try
+            {
+                Cipher cipher;
+                if (encryptionConfig.containsKey(EncryptionContext.ENCRYPTION_IV))
+                {
+                    cipher = encryptionContext.getDecryptor();
+                }
+                else
+                {
+                    cipher = encryptionContext.getEncryptor();
+                    ImmutableMap<String, Object> encParams = ImmutableMap.<String, Object>builder()
+                                                                 .putAll(encryptionContext.toHeaderParameters())
+                                                                 .put(EncryptionContext.ENCRYPTION_IV, Hex.bytesToHex(cipher.getIV()))
+                                                                 .build();
+
+                    Map<String, Object> map = new HashMap<>(params);
+                    map.put(ENCRYPTION, encParams);
+                    params = ImmutableMap.<String, Object>builder().putAll(map).build();
+                }
+                return new EncryptionData(cipher, encryptionContext.getCompressor(), params);
+            }
+            catch (IOException ioe)
+            {
+                logger.warn("failed to create encyption context for hints file. ignoring encryption for hints.", ioe);
+                return null;
+            }
+        }
+        else
+        {
+            return null;
+        }
+    }
+
+    private static final class EncryptionData
+    {
+        final Cipher cipher;
+        final ICompressor compressor;
+        final ImmutableMap<String, Object> params;
+
+        private EncryptionData(Cipher cipher, ICompressor compressor, ImmutableMap<String, Object> params)
+        {
+            this.cipher = cipher;
+            this.compressor = compressor;
+            this.params = params;
+        }
     }
 
     String fileName()
@@ -93,7 +216,7 @@ final class HintsDescriptor
         switch (hintsVersion)
         {
             case VERSION_30:
-                return MessagingService.VERSION_30;
+                return MessagingService.FORCE_3_0_PROTOCOL_VERSION ? MessagingService.VERSION_30 : MessagingService.VERSION_3014;
             default:
                 throw new AssertionError();
         }
@@ -102,6 +225,47 @@ final class HintsDescriptor
     static boolean isHintFileName(Path path)
     {
         return pattern.matcher(path.getFileName().toString()).matches();
+    }
+
+    static Optional<HintsDescriptor> readFromFileQuietly(Path path)
+    {
+        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r"))
+        {
+            return Optional.of(deserialize(raf));
+        }
+        catch (ChecksumMismatchException e)
+        {
+            throw new FSReadError(e, path.toFile());
+        }
+        catch (IOException e)
+        {
+            handleDescriptorIOE(e, path);
+            return Optional.empty();
+        }
+    }
+
+    @VisibleForTesting
+    static void handleDescriptorIOE(IOException e, Path path)
+    {
+        try
+        {
+            if (Files.size(path) > 0)
+            {
+                String newFileName = path.getFileName().toString().replace(".hints", ".corrupt.hints");
+                Path target = path.getParent().resolve(newFileName);
+                logger.error("Failed to deserialize hints descriptor {} - saving file as {}", path.toString(), target, e);
+                Files.move(path, target);
+            }
+            else
+            {
+                logger.warn("Found empty hints file {} on startup, removing", path.toString());
+                Files.delete(path);
+            }
+        }
+        catch (IOException ex)
+        {
+            logger.error("Error handling corrupt hints file {}", path.toString(), ex);
+        }
     }
 
     static HintsDescriptor readFromFile(Path path)
@@ -114,6 +278,30 @@ final class HintsDescriptor
         {
             throw new FSReadError(e, path.toFile());
         }
+    }
+
+    public boolean isCompressed()
+    {
+        return compressionConfig != null;
+    }
+
+    public boolean isEncrypted()
+    {
+        return cipher != null;
+    }
+
+    public ICompressor createCompressor()
+    {
+        if (isCompressed())
+            return CompressionParams.createCompressor(compressionConfig);
+        if (isEncrypted())
+            return compressor;
+        return null;
+    }
+
+    public Cipher getCipher()
+    {
+        return isEncrypted() ? cipher : null;
     }
 
     @Override
@@ -237,6 +425,6 @@ final class HintsDescriptor
     private static void validateCRC(int expected, int actual) throws IOException
     {
         if (expected != actual)
-            throw new IOException("Hints Descriptor CRC Mismatch");
+            throw new ChecksumMismatchException("Hints Descriptor CRC Mismatch");
     }
 }

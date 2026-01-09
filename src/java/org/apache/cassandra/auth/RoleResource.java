@@ -20,7 +20,6 @@ package org.apache.cassandra.auth;
 import java.util.Set;
 
 import com.google.common.base.Objects;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 
@@ -50,7 +49,8 @@ public class RoleResource implements IResource, Comparable<RoleResource>
     // permissions which may be granted on role level resources
     private static final Set<Permission> ROLE_LEVEL_PERMISSIONS = Sets.immutableEnumSet(Permission.ALTER,
                                                                                         Permission.DROP,
-                                                                                        Permission.AUTHORIZE);
+                                                                                        Permission.AUTHORIZE,
+                                                                                        Permission.DESCRIBE);
 
     private static final String ROOT_NAME = "roles";
     private static final RoleResource ROOT_RESOURCE = new RoleResource();
@@ -96,9 +96,9 @@ public class RoleResource implements IResource, Comparable<RoleResource>
      */
     public static RoleResource fromName(String name)
     {
-        String[] parts = StringUtils.split(name, '/');
+        String[] parts = StringUtils.split(name, "/", 2);
 
-        if (!parts[0].equals(ROOT_NAME) || parts.length > 2)
+        if (!parts[0].equals(ROOT_NAME))
             throw new IllegalArgumentException(String.format("%s is not a valid role resource name", name));
 
         if (parts.length == 1)

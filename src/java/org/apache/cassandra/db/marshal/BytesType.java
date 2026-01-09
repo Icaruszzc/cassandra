@@ -25,6 +25,7 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.BytesSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Hex;
 
@@ -32,12 +33,7 @@ public class BytesType extends AbstractType<ByteBuffer>
 {
     public static final BytesType instance = new BytesType();
 
-    BytesType() {} // singleton
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
-    {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
+    BytesType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
     public ByteBuffer fromString(String source)
     {
@@ -69,7 +65,7 @@ public class BytesType extends AbstractType<ByteBuffer>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return "\"0x" + ByteBufferUtil.bytesToHex(buffer) + '"';
     }
@@ -86,11 +82,6 @@ public class BytesType extends AbstractType<ByteBuffer>
     public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
     {
         // BytesType can read anything
-        return true;
-    }
-
-    public boolean isByteOrderComparable()
-    {
         return true;
     }
 

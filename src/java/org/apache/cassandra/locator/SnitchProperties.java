@@ -21,6 +21,8 @@ import java.io.InputStream;
 import java.net.URL;
 import java.util.Properties;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.io.util.FileUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,9 +44,9 @@ public class SnitchProperties
             URL url;
             if (configURL == null)
                 url = SnitchProperties.class.getClassLoader().getResource(RACKDC_PROPERTY_FILENAME);
-            else 
+            else
             	url = new URL(configURL);
-            
+
             stream = url.openStream(); // catch block handles potential NPE
             properties.load(stream);
         }
@@ -59,11 +61,22 @@ public class SnitchProperties
         }
     }
 
+    @VisibleForTesting
+    public SnitchProperties(Properties properties)
+    {
+        this.properties = properties;
+    }
+
     /**
      * Get a snitch property value or return defaultValue if not defined.
      */
     public String get(String propertyName, String defaultValue)
     {
         return properties.getProperty(propertyName, defaultValue);
+    }
+
+    public boolean contains(String propertyName)
+    {
+        return properties.containsKey(propertyName);
     }
 }

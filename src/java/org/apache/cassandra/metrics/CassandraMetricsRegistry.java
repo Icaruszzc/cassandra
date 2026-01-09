@@ -17,13 +17,15 @@
  */
 package org.apache.cassandra.metrics;
 
-import java.lang.management.ManagementFactory;
 import java.lang.reflect.Method;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 import com.codahale.metrics.*;
-import javax.management.*;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
+
+import org.apache.cassandra.utils.MBeanWrapper;
 
 /**
  * Makes integrating 3.0 metrics API with 2.0.
@@ -35,7 +37,7 @@ public class CassandraMetricsRegistry extends MetricRegistry
 {
     public static final CassandraMetricsRegistry Metrics = new CassandraMetricsRegistry();
 
-    private final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+    private final MBeanWrapper mBeanServer = MBeanWrapper.instance;
 
     private CassandraMetricsRegistry()
     {
@@ -72,24 +74,24 @@ public class CassandraMetricsRegistry extends MetricRegistry
         return meter;
     }
 
-    public Histogram histogram(MetricName name)
+    public Histogram histogram(MetricName name, boolean considerZeroes)
     {
-        Histogram histogram = register(name, new ClearableHistogram(new EstimatedHistogramReservoir()));
+        Histogram histogram = register(name, new ClearableHistogram(new DecayingEstimatedHistogramReservoir(considerZeroes)));
         registerMBean(histogram, name.getMBeanName());
 
         return histogram;
     }
 
-    public Histogram histogram(MetricName name, MetricName alias)
+    public Histogram histogram(MetricName name, MetricName alias, boolean considerZeroes)
     {
-        Histogram histogram = histogram(name);
+        Histogram histogram = histogram(name, considerZeroes);
         registerAlias(name, alias);
         return histogram;
     }
 
     public Timer timer(MetricName name)
     {
-        Timer timer = register(name, new Timer(new EstimatedHistogramReservoir()));
+        Timer timer = register(name, new Timer(new DecayingEstimatedHistogramReservoir()));
         registerMBean(timer, name.getMBeanName());
 
         return timer;
@@ -173,7 +175,8 @@ public class CassandraMetricsRegistry extends MetricRegistry
         try
         {
             mBeanServer.registerMBean(mbean, name);
-        } catch (Exception ignored) {}
+        }
+        catch (Exception ignored) {}
     }
 
     private void registerAlias(MetricName existingName, MetricName aliasName)
@@ -188,8 +191,20 @@ public class CassandraMetricsRegistry extends MetricRegistry
     {
         try
         {
-            mBeanServer.unregisterMBean(name.getMBeanName());
-        } catch (Exception ignore) {}
+            MBeanWrapper.instance.unregisterMBean(name.getMBeanName());
+        } catch (Exception ignored) {}
+    }
+    
+    /**
+     * Strips a single final '$' from input
+     * 
+     * @param s String to strip
+     * @return a string with one less '$' at end
+     */
+    private static String withoutFinalDollar(String s)
+    {
+        int l = s.length();
+        return (l!=0 && '$' == s.charAt(l-1))?s.substring(0,l-1):s;
     }
 
     public interface MetricMBean
@@ -601,7 +616,7 @@ public class CassandraMetricsRegistry extends MetricRegistry
         public MetricName(Class<?> klass, String name, String scope)
         {
             this(klass.getPackage() == null ? "" : klass.getPackage().getName(),
-                    klass.getSimpleName().replaceAll("\\$$", ""),
+                    withoutFinalDollar(klass.getSimpleName()),
                     name,
                     scope);
         }
@@ -811,7 +826,7 @@ public class CassandraMetricsRegistry extends MetricRegistry
         {
             if (type == null || type.isEmpty())
             {
-                type = klass.getSimpleName().replaceAll("\\$$", "");
+                type = withoutFinalDollar(klass.getSimpleName());
             }
             return type;
         }

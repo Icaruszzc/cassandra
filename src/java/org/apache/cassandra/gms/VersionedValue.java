@@ -20,16 +20,21 @@ package org.apache.cassandra.gms;
 import java.io.*;
 import java.net.InetAddress;
 import java.util.Collection;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.format.VersionAndType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
@@ -64,6 +69,7 @@ public class VersionedValue implements Comparable<VersionedValue>
 
     // values for ApplicationState.STATUS
     public final static String STATUS_BOOTSTRAPPING = "BOOT";
+    public final static String STATUS_BOOTSTRAPPING_REPLACE = "BOOT_REPLACE";
     public final static String STATUS_NORMAL = "NORMAL";
     public final static String STATUS_LEAVING = "LEAVING";
     public final static String STATUS_LEFT = "LEFT";
@@ -92,6 +98,12 @@ public class VersionedValue implements Comparable<VersionedValue>
         this.version = version;
     }
 
+    @VisibleForTesting
+    public static VersionedValue unsafeMakeVersionedValue(String value, int version)
+    {
+        return new VersionedValue(value, version);
+    }
+
     private VersionedValue(String value)
     {
         this(value, VersionGenerator.getNextVersion());
@@ -106,6 +118,11 @@ public class VersionedValue implements Comparable<VersionedValue>
     public String toString()
     {
         return "Value(" + value + "," + version + ")";
+    }
+
+    public byte[] toBytes()
+    {
+        return value.getBytes(ISO_8859_1);
     }
 
     private static String versionString(String... args)
@@ -125,6 +142,11 @@ public class VersionedValue implements Comparable<VersionedValue>
         public VersionedValue cloneWithHigherVersion(VersionedValue value)
         {
             return new VersionedValue(value.value);
+        }
+
+        public VersionedValue bootReplacing(InetAddress oldNode)
+        {
+            return new VersionedValue(versionString(VersionedValue.STATUS_BOOTSTRAPPING_REPLACE, oldNode.getHostAddress()));
         }
 
         public VersionedValue bootstrapping(Collection<Token> tokens)
@@ -239,7 +261,13 @@ public class VersionedValue implements Comparable<VersionedValue>
 
         public VersionedValue releaseVersion()
         {
-            return new VersionedValue(FBUtilities.getReleaseVersionString());
+            return releaseVersion(FBUtilities.getReleaseVersionString());
+        }
+
+        @VisibleForTesting
+        public VersionedValue releaseVersion(String version)
+        {
+            return new VersionedValue(version);
         }
 
         public VersionedValue networkVersion()
@@ -255,6 +283,13 @@ public class VersionedValue implements Comparable<VersionedValue>
         public VersionedValue severity(double value)
         {
             return new VersionedValue(String.valueOf(value));
+        }
+
+        public VersionedValue sstableVersions(Set<VersionAndType> versions)
+        {
+            return new VersionedValue(versions.stream()
+                                              .map(VersionAndType::toString)
+                                              .collect(Collectors.joining(",")));
         }
     }
 

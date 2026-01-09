@@ -35,7 +35,6 @@ import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
 import org.apache.cassandra.utils.UUIDSerializer;
@@ -80,6 +79,12 @@ public class Commit
     public boolean hasBallot(UUID ballot)
     {
         return this.ballot.equals(ballot);
+    }
+
+    /** Whether this is an empty commit, that is one with no updates. */
+    public boolean isEmpty()
+    {
+        return update.isEmpty();
     }
 
     public Mutation makeMutation()
